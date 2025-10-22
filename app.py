@@ -1,41 +1,34 @@
-# app.py — Portafolio Deuda (Oracle con SID, PWD embebida)
-# Ajustes: Header oscuro + menús visibles (⋮ y Deploy) + sin pestaña "Exportar"
-# Probado para VS Code (Windows). Codificación: UTF-8
+# app.py — Portafolio Deuda (Oracle con SID, PWD por secrets/env)
+# Ajustes mínimos: quitar HARDCODED_PWD y leer credenciales seguras
+# Mantiene: Header oscuro + menús visibles (⋮ y Deploy) + sin pestaña "Exportar"
 
-import io, re, math, os, sys, traceback
-from typing import List, Optional, Dict, Any
-
+import io, re, math, os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
-
-try:
-    import oracledb
-except Exception as e:
-    st.stop()
-
+import oracledb
 from datetime import date
 
 # =========================
-# CONFIG: ORACLE + PWD
+#  CONFIG: ORACLE (secrets/env)
 # =========================
-HOST = "34.134.141.229"
-PORT = 1522
-SID  = "DESA2"
-USER = "HUB_USER"
-HARDCODED_PWD = "gunoc35WRlhOx2X"   # ← reemplaza si cambia
+HOST = st.secrets.get("ORACLE_HOST", os.getenv("ORACLE_HOST", "34.134.141.229"))
+PORT = int(st.secrets.get("ORACLE_PORT", os.getenv("ORACLE_PORT", "1522")))
+SID  = st.secrets.get("ORACLE_SID",  os.getenv("ORACLE_SID",  "DESA2"))
+USER = st.secrets.get("ORACLE_USER", os.getenv("ORACLE_USER", "HUB_USER"))
+PWD  = st.secrets.get("ORACLE_PWD",  os.getenv("ORACLE_PWD", ""))  # ← ya no hay HARDCODED_PWD
 
-INFLACION_ANUAL = 0.035
-DEFAULT_ALIAS   = "UNIB"
+INFLACION_ANUAL = float(st.secrets.get("INFLACION_ANUAL", os.getenv("INFLACION_ANUAL", "0.035")))
+DEFAULT_ALIAS   = st.secrets.get("DEFAULT_ALIAS", os.getenv("DEFAULT_ALIAS", "UNIB"))
 
 # =========================
-# PAGE SETUP + Tema — CONTRASTE ALTO
+#  PAGE SETUP + Tema — CONTRASTE ALTO
 # =========================
 st.set_page_config(page_title="Portafolio Deuda — Oracle", page_icon=None, layout="wide")
 
-def css_base_with_sidebar() -> str:
+def css_base_with_sidebar():
     return """
     <style>
     :root{
@@ -57,6 +50,7 @@ def css_base_with_sidebar() -> str:
     }
     .stTabs [aria-selected="true"]{border-bottom-color:var(--accent1) !important; color:#fff !important}
 
+    /* Header superior (antes blanco) */
     header[data-testid="stHeader"]{
       background:
         radial-gradient(800px 400px at 10% 0%, rgba(96,165,250,.15), transparent),
@@ -70,7 +64,7 @@ def css_base_with_sidebar() -> str:
       fill:#f1f5f9 !important;
     }
 
-    /* Menú de 3 puntitos y popovers */
+    /* ======== Menú de 3 puntitos (Main menu) y popovers ======== */
     div[data-testid="stMainMenu"],
     section[aria-label="Main menu"],
     [role="menu"]{
@@ -83,37 +77,45 @@ def css_base_with_sidebar() -> str:
     [role="menu"] [role="menuitem"],
     [role="menu"] a,
     [role="menu"] button{
-      background:transparent !important; color:#f1f5f9 !important;
+      background:transparent !important;
+      color:#f1f5f9 !important;
     }
     [role="menu"] [role="menuitem"]:hover,
     [role="menu"] a:hover,
     [role="menu"] button:hover{
       background:rgba(255,255,255,.08) !important;
     }
-    [role="menu"] hr{ border:none !important; border-top:1px solid rgba(255,255,255,.18) !important; }
+    [role="menu"] hr{
+      border:none !important;
+      border-top:1px solid rgba(255,255,255,.18) !important;
+    }
 
-    /* Botón/menú de Deploy */
+    /* ======== Botón/menú de Deploy (badge superior derecho) ======== */
     [data-testid="stStatusWidget"] *,
     [class*="viewerBadge_container"],
     [class*="viewerBadge_links"] *{
-      color:#f1f5f9 !important; fill:#f1f5f9 !important;
+      color:#f1f5f9 !important;
+      fill:#f1f5f9 !important;
     }
     [role="tooltip"],
     [data-testid="stTooltip"]{
-      background:#0f1a38 !important; color:#f1f5f9 !important;
+      background:#0f1a38 !important;
+      color:#f1f5f9 !important;
       border:1px solid rgba(255,255,255,.18) !important;
       box-shadow:0 12px 32px rgba(0,0,0,.45) !important;
     }
     button[data-testid="baseButton-header"],
     button[data-testid="baseButton-headerNoPadding"],
     header [role="button"]{
-      color:#f1f5f9 !important; fill:#f1f5f9 !important;
+      color:#f1f5f9 !important;
+      fill:#f1f5f9 !important;
     }
 
+    /* Dataframe headers/body más legibles */
     .dataframe thead tr th{background:rgba(124,58,237,.30); color:#f1f5f9; border:0}
     .dataframe tbody tr{background:rgba(255,255,255,.04); color:#e5e7eb}
 
-    /* Sidebar */
+    /* Sidebar con contraste */
     section[data-testid="stSidebar"]{
       color: var(--ink);
       background:
@@ -130,6 +132,7 @@ def css_base_with_sidebar() -> str:
     }
     .sb-title{font-size:.9rem;color:#ffffff;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
 
+    /* Chips de encabezado */
     .chip{
       display:inline-block; padding:.28rem .60rem; border-radius:999px; margin:2px 6px 8px 0;
       background:linear-gradient(90deg, rgba(124,58,237,.28), rgba(34,211,238,.22));
@@ -137,9 +140,28 @@ def css_base_with_sidebar() -> str:
       text-shadow:0 1px 2px rgba(0,0,0,.35);
     }
 
+    /* Listas tipo ranking (no tabulares) para Asset */
+    .rank-section{ margin-top:12px; }
+    .rank-title{ font-weight:800; margin-bottom:8px; color:#ffffff; }
+    .rank-list{ list-style: none; padding-left:0; margin:0; }
+    .rank-item{
+      display:flex; justify-content:space-between; align-items:center;
+      background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.22);
+      border-radius:12px; padding:10px 12px; margin-bottom:8px;
+    }
+    .rank-left{ display:flex; gap:10px; align-items:center; }
+    .rank-badge{
+      width:26px; height:26px; border-radius:999px; display:inline-flex; align-items:center; justify-content:center;
+      background:linear-gradient(135deg, rgba(96,165,250,.38), rgba(34,211,238,.32));
+      border:1px solid rgba(255,255,255,.28); font-weight:800; color:#0b1020;
+    }
+    .rank-name{ font-weight:800; color:#ffffff; }
+    .rank-right{ font-variant-numeric: tabular-nums; color:#f1f5f9; }
+
+    /* Tarjetas resumen deuda */
     .kpi-grid{display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap:12px; margin: 6px 0 8px 0;}
     .kpi-card{
-      background: linear-gradient(180deg, rgba(34,197,94,.20), rgba(2,6,23,.12));
+      background: linear-gradient(180deg, rgba(34,197,94,.20), rgba(2,6,23,.12)); /* base legible */
       border:1px solid rgba(34,197,94,.45);
       border-radius: 14px; padding: 12px 14px;
       box-shadow: 0 10px 28px rgba(0,0,0,.35);
@@ -151,15 +173,18 @@ def css_base_with_sidebar() -> str:
     .kpi-label{ font-size:.78rem; color:#e2e8f0; letter-spacing:.06em; text-transform:uppercase }
     .kpi-value{ font-size:1.45rem; font-weight:900; color:#ffffff; margin-top:4px }
 
-    @media (max-width:1200px){ .kpi-grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
-    @media (max-width:800px){ .kpi-grid{ grid-template-columns: repeat(1, minmax(0,1fr)); } }
+    @media (max-width:1200px){
+      .kpi-grid{ grid-template-columns: repeat(2, minmax(0,1fr)); }
+    }
+    @media (max-width:800px){
+      .kpi-grid{ grid-template-columns: repeat(1, minmax(0,1fr)); }
+    }
     </style>
     """
-
 st.markdown(css_base_with_sidebar(), unsafe_allow_html=True)
 
 # =========================
-# Sidebar (solo estilo + controles)
+#  Sidebar (solo estilo)
 # =========================
 with st.sidebar:
     st.markdown('<div class="sb-card"><div class="sb-title">Parámetros</div>', unsafe_allow_html=True)
@@ -170,43 +195,38 @@ with st.sidebar:
         y = st.number_input("Año", 2000, 2100, hoy.year, step=1)
     with colm:
         m = st.number_input("Mes", 1, 12, hoy.month, step=1)
-    st.caption("Conexión por SID (igual que Colab). PWD embebida en el código.")
+    st.caption("Conexión por SID (igual que Colab). PWD segura por secrets/env.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sb-card"><div class="sb-title">Filtros Deuda</div>', unsafe_allow_html=True)
     st.caption("Aplican solo a la pestaña Deuda (ID_CLIENTE / ID_PRODUCTO).")
 
 # =========================
-# Fechas
+#  Fechas
 # =========================
-F_DIA_INI = pd.Timestamp(year=int(y), month=int(m), day=1)
+F_DIA_INI = pd.Timestamp(year=y, month=m, day=1)
 F_DIA_FIN = F_DIA_INI + pd.offsets.MonthEnd(1)
 F_DIA_FIN_NEXT = F_DIA_FIN + pd.Timedelta(days=1)
 FECHA_ESTADISTICA = F_DIA_FIN.strftime("%Y-%m-%d")
 
 # =========================
-# Conexión (SID + PWD hardcoded)
+#  Conexión (SID + PWD desde secrets/env)
 # =========================
 def get_conn():
-    if not HARDCODED_PWD or HARDCODED_PWD == "PON_AQUI_TU_PASSWORD":
-        raise RuntimeError("Define HARDCODED_PWD con tu contraseña real.")
-    # Modo thin: no requiere Instant Client
+    if not PWD:
+        raise RuntimeError("Falta ORACLE_PWD en secrets o variable de entorno.")
     dsn = oracledb.makedsn(HOST, PORT, sid=SID)
     oracledb.defaults.arraysize = 1000
     oracledb.defaults.prefetchrows = 1000
-    try:
-        return oracledb.connect(user=USER, password=HARDCODED_PWD, dsn=dsn)
-    except Exception as e:
-        st.error(f"❌ Error conectando a Oracle: {e}")
-        st.stop()
+    return oracledb.connect(user=USER, password=PWD, dsn=dsn)
 
 @st.cache_data(show_spinner=True)
-def run_sql(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def run_sql(sql: str, params: dict | None = None) -> pd.DataFrame:
     conn = get_conn()
     return pd.read_sql(sql, conn, params=params or {})
 
 # =========================
-# Helpers
+#  Helpers
 # =========================
 def sanitize_int_list(lst):
     if lst is None: return []
@@ -218,7 +238,7 @@ def sanitize_int_list(lst):
             pass
     return sorted(set(safe))
 
-def sql_in_clause(colname: str, ints: List[int]) -> str:
+def sql_in_clause(colname: str, ints: list[int]) -> str:
     return "" if not ints else f"{colname} IN ({','.join(str(i) for i in ints)})"
 
 def parse_pct_col(s):
@@ -236,7 +256,7 @@ def parse_money_to_float(s):
     except: return 0.0
 
 # =========================
-# Catálogos: Clientes y Productos (SOLO Deuda) — DISTINCT
+#  Catálogos: Clientes y Productos (SOLO Deuda) — DISTINCT
 # =========================
 @st.cache_data(show_spinner=True)
 def fetch_clientes(alias: str) -> pd.DataFrame:
@@ -253,13 +273,9 @@ def fetch_clientes(alias: str) -> pd.DataFrame:
     return df[["ID_CLIENTE","ETIQUETA"]]
 
 @st.cache_data(show_spinner=True)
-def fetch_productos_desde_his(
-    alias: str,
-    sel_id_clientes: List[int],
-    f_ini: pd.Timestamp,
-    f_fin_next: pd.Timestamp,
-    fecha_estadistica: str
-) -> pd.DataFrame:
+def fetch_productos_desde_his(alias: str, sel_id_clientes: list[int],
+                              f_ini: pd.Timestamp, f_fin_next: pd.Timestamp,
+                              fecha_estadistica: str) -> pd.DataFrame:
     if not sel_id_clientes:
         q_all = "SELECT DISTINCT ID_CLIENTE FROM SIAPII.V_M_CONTRATO_CDM WHERE ALIAS_CDM = :alias"
         df_all = run_sql(q_all, {"alias": alias})
@@ -320,9 +336,9 @@ def fetch_productos_desde_his(
     return df
 
 # =========================
-# WHERE dinámico SOLO para Deuda
+#  WHERE dinámico SOLO para Deuda
 # =========================
-def where_filters_for_his(alias: str, id_clientes: List[int], productos: List[int]) -> str:
+def where_filters_for_his(alias: str, id_clientes: list[int], productos: list[int]) -> str:
     parts = ["c.ALIAS_CDM = :alias_up", "c.ID_CLIENTE = h.ID_CLIENTE"]
     if id_clientes:
         parts.append(sql_in_clause("h.ID_CLIENTE", sanitize_int_list(id_clientes)))
@@ -331,7 +347,7 @@ def where_filters_for_his(alias: str, id_clientes: List[int], productos: List[in
     return "WHERE EXISTS ( SELECT 1 FROM SIAPII.V_M_CONTRATO_CDM c WHERE " + " AND ".join(parts) + " )"
 
 # =========================
-# Queries
+#  Queries
 # =========================
 CASE_ACTIVO = """
   CASE e.ID_TIPO_ACTIVO
@@ -387,13 +403,8 @@ def build_snapshot_params(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timest
     return params, date_expr
 
 @st.cache_data(show_spinner=True)
-def query_snapshot(
-    alias: str,
-    f_ini: pd.Timestamp,
-    f_fin_next: pd.Timestamp,
-    id_clientes: List[int],
-    productos: List[int]
-) -> pd.DataFrame:
+def query_snapshot(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp,
+                   id_clientes: list[int], productos: list[int]) -> pd.DataFrame:
     params, DATE_EXPR = build_snapshot_params(alias, f_ini, f_fin_next)
     where_exists = where_filters_for_his(alias, id_clientes, productos)
 
@@ -485,7 +496,7 @@ ORDER BY
     return run_sql(SQL_SNAPSHOT, params=params)
 
 # =========================
-# Cálculos y helpers
+#  Cálculos y helpers
 # =========================
 K = 360.0 / 365.0
 def parse_rate_any(x):
@@ -495,15 +506,12 @@ def parse_rate_any(x):
     s = re.sub(r'(?<=\d),(?=\d{3}\b)', '', s)
     try: return float(s)
     except: return np.nan
-
 def auto_to_decimal(series):
     vals = pd.to_numeric(series, errors='coerce'); med = vals.dropna().median()
     return vals if (pd.notna(med) and 0 < med < 1) else vals * 0.01
-
 def fmt_pct(x):    return "—" if pd.isna(x) else f"{x*100:.2f}%"
 def fmt_money0(x): return f"{x:,.0f}"
 def fmt_money2(x): return f"${x:,.2f}"
-
 def eq365(rate_dec, cap_series):
     base = 1.0 + (rate_dec / cap_series.replace(0, np.nan))
     base = pd.Series(base, index=cap_series.index).fillna(1.0)
@@ -514,57 +522,42 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
     if df_snap is None or df_snap.empty:
         raise ValueError("No hay datos de Deuda para el periodo/alias/filtrado seleccionado.")
     df = df_snap.copy()
-
     ytm_dec   = auto_to_decimal(df['EMIS_TASA'].apply(parse_rate_any))
     tbase_dec = auto_to_decimal(df.get('TASA_BASE', pd.Series([np.nan]*len(df))).apply(parse_rate_any))
-
     f_vto = pd.to_datetime(df['FECHA_VTO_EM'], errors='coerce')
     f_corte = pd.to_datetime(df['FECHA_CORTE'], errors='coerce')
     dxv_bruto = (f_vto - f_corte).dt.days
-
     is_reporto = df['TIPO_PAPEL'].astype(str).str.contains('reporto', case=False, na=False) | \
                  df['TIPO_INSTRUMENTO'].astype(str).str.contains('reporto', case=False, na=False)
     is_cero = df['TIPO_INSTRUMENTO'].astype(str).str.contains('cero', case=False, na=False)
-
     dxv_mostrado = pd.Series(np.where(is_reporto, 1, dxv_bruto), index=df.index)
-
     plazo = pd.to_numeric(df['PLAZO_CUPON'], errors='coerce')
     dxv_sql = pd.to_numeric(df.get('DIAS_X_V', np.nan), errors='coerce')
     dxv_real = dxv_sql.where(dxv_sql.notna(), dxv_bruto)
-
     periodo_dias = pd.Series(np.where(is_reporto, 1,
                                       np.where(is_cero & dxv_real.notna() & (dxv_real > 0), dxv_real, plazo)),
                              index=df.index).fillna(28).clip(lower=1)
-
     cap = 360.0 / periodo_dias
-
     infl = float(inflacion_anual)
     es_real = (df['TIPO_INSTRUMENTO'].astype(str).str.contains('tasa real', case=False, na=False)) & \
               (pd.to_numeric(df['ID_DIVISA_TV'], errors='coerce') == 8)
     es_revisable = df['TIPO_INSTRUMENTO'].astype(str).str.contains('revis', case=False, na=False)
-
     mask_nominal = ~(es_real | es_revisable)
-
     t_eq_nominal   = eq365(ytm_dec, cap)
     t_in_revisable = tbase_dec.fillna(0.0) + ytm_dec.fillna(0.0)
     t_eq_revisable = eq365(t_in_revisable, cap)
     t_eq_real      = eq365(ytm_dec, cap)
     t_nom_real     = ((1.0 + (t_eq_real / K)) * (1.0 + (infl / K)) - 1.0) * K
-
     t_carry = pd.Series(np.nan, index=df.index, dtype=float)
     t_carry[mask_nominal] = t_eq_nominal[mask_nominal]
     t_carry[es_revisable] = t_eq_revisable[es_revisable]
     t_carry[es_real]      = t_nom_real[es_real]
-
     val_real = pd.to_numeric(df['VALOR_REAL'], errors='coerce').fillna(0.0)
     peso = (val_real / val_real.sum()) if val_real.sum() > 0 else pd.Series(0.0, index=df.index)
-
     val_nom_raw = pd.to_numeric(df['VALOR_NOMINAL'], errors='coerce').fillna(0.0) * 100.0
     val_nom_raw = np.where(is_reporto, 0.0, val_nom_raw)
-
     carry_total_pp = float((t_carry * peso).sum() * 100.0)
     dxv_total_pond = float((dxv_mostrado.fillna(0.0) * peso).sum())
-
     duracion_dias  = pd.to_numeric(df.get('DURACION_DIAS', np.nan), errors='coerce')
     dur_portafolio = float((duracion_dias.fillna(0.0) * peso).sum()) if 'DURACION_DIAS' in df else None
 
@@ -585,18 +578,16 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
         'Tasa base'           : df.get('TASA_BASE', pd.Series([np.nan]*len(df))),
         'Calificación'        : df['CALIFICACION_HOMOLOGADA'].astype(str),
     })
-
     # Orden del detalle; TOTAL al final
     ord_tp = {'Reporto':1,'Gubernamental':2,'CuasiGuber':3,'Banca Comercial':4,'Privado':5}
     is_rep = df_final['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
              df_final['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
     df_final['__ord__'] = np.where(is_rep, 1, df_final['Tipo de Papel'].map(ord_tp).fillna(98))
-    df_final['__m__']   = val_real.fillna(0.0)
+    df_final['__m__']   = df['VALOR_REAL'].fillna(0.0)
     df_detail = (df_final
                  .sort_values(['__ord__','__m__'], ascending=[True, False])
                  .drop(columns=['__ord__','__m__'])
                  .reset_index(drop=True))
-
     row_total = {
         'Tipo de Papel':'','Tipo de instrumento':'','Instrumento':'TOTAL','Fecha vto':'',
         'DxV':f"{dxv_total_pond:.0f}", 'Duración (días)':(f"{dur_portafolio:.0f}" if dur_portafolio is not None else ''),
@@ -607,12 +598,12 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
     return pd.concat([df_detail, pd.DataFrame([row_total])], ignore_index=True)
 
 # =========================
-# Visual helpers
+#  Visual helpers
 # =========================
 def barh_percent_figure(series_pct: pd.Series, title: str) -> go.Figure:
     serie_ord = series_pct.sort_values(ascending=True)
     labels = serie_ord.index.astype(str).tolist(); vals = serie_ord.values
-    xmax = max(20, int(math.ceil((np.nanmax(vals) if len(vals) else 0) / 20.0) * 20)) if len(vals) else 20
+    xmax = max(20, int(math.ceil(np.nanmax(vals) / 20.0) * 20)) if len(vals) else 20
     fig = go.Figure()
     fig.add_trace(go.Bar(x=vals, y=labels, orientation='h',
                          marker=dict(color=vals, colorscale='Blues', showscale=False),
@@ -621,8 +612,8 @@ def barh_percent_figure(series_pct: pd.Series, title: str) -> go.Figure:
         xaxis=dict(range=[0, xmax], tickmode='linear', dtick=20, title='% cartera', gridcolor='rgba(255,255,255,.22)'),
         yaxis=dict(title=''), margin=dict(l=10, r=10, t=40, b=10),
         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(255,255,255,.05)', font=dict(color='#f9fafb'), height=420)
-    for yv, v in zip(labels, vals):
-        fig.add_annotation(x=float(v) + xmax*0.01, y=yv, text=f"{float(v):.2f}%", showarrow=False,
+    for y, v in zip(labels, vals):
+        fig.add_annotation(x=v + xmax*0.01, y=y, text=f"{v:.2f}%", showarrow=False,
                            font=dict(size=12, color='#e2e8f0'), xanchor='left', yanchor='middle')
     return fig
 
@@ -637,13 +628,17 @@ def donut_figure(labels, values, title: str) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,.05)", font=dict(color="#f9fafb"), height=440)
     return fig
 
-def _interp_rgb(c1, c2, t): return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))
+def _interp_rgb(c1, c2, t):
+    return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))
 def _hex_to_rgb(h): h=h.lstrip('#'); return tuple(int(h[i:i+2],16) for i in (0,2,4))
 def _rgb_to_hex(rgb): return '#%02x%02x%02x' % rgb
 
 def gradient_gyr(n:int):
-    g = _hex_to_rgb("#22c55e"); y = _hex_to_rgb("#fde047"); r = _hex_to_rgb("#ef4444")
-    if n <= 1: return ["#22c55e"]
+    g = _hex_to_rgb("#22c55e")
+    y = _hex_to_rgb("#fde047")
+    r = _hex_to_rgb("#ef4444")
+    if n <= 1:
+        return ["#22c55e"]
     colors = []
     for i in range(n):
         t = i/(n-1)
@@ -690,7 +685,7 @@ def risk_table_semaforo(r_df: pd.DataFrame, title: str = "Riesgo por Calificaci�
     return fig
 
 # =========================
-# PIPELINE
+#  PIPELINE
 # =========================
 with st.spinner("Consultando Oracle y construyendo vistas..."):
     # --- Asset Allocation (SIN filtros de cliente/producto) ---
@@ -717,8 +712,8 @@ with st.spinner("Consultando Oracle y construyendo vistas..."):
     # --- Filtros Deuda (sidebar) ---
     df_cli = fetch_clientes(ALIAS_CDM)
     if df_cli.empty:
-        sel_id_clientes: List[int] = []
-        opts_cli: List[str] = []
+        sel_id_clientes = []
+        opts_cli = []
     else:
         opts_cli = df_cli.apply(lambda r: f"{int(r.ID_CLIENTE)} — {r.ETIQUETA}", axis=1).tolist()
         id_map = {opt:int(df_cli.ID_CLIENTE.iloc[i]) for i,opt in enumerate(opts_cli)}
@@ -729,7 +724,7 @@ with st.spinner("Consultando Oracle y construyendo vistas..."):
     st.sidebar.markdown("**Producto(s) — SOLO Deuda**")
     if df_prod.empty:
         st.sidebar.warning("No se detectaron productos para los ID_CLIENTE seleccionados (en el mes). Puedes ingresar IDs manuales.")
-        sel_prod_ids: List[int] = []
+        sel_prod_ids = []
     else:
         prod_options = df_prod.apply(
             lambda r: f"{int(r.ID_PRODUCTO)} — {r.DESCRIPCION} ({r.ACTIVO})", axis=1
@@ -744,14 +739,14 @@ with st.spinner("Consultando Oracle y construyendo vistas..."):
         sel_prod_ids = sorted(set((sel_prod_ids or []) + manual_ids))
 
 # =========================
-# Queries Deuda + DF final
+#  Queries Deuda + DF final
 # =========================
 with st.spinner("Calculando Deuda…"):
     df_snap = query_snapshot(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT, sel_id_clientes, sel_prod_ids)
     df_final = build_df_final(df_snap, INFLACION_ANUAL)
 
 # =========================
-# TÍTULO
+#  TÍTULO
 # =========================
 st.title("Portafolio Deuda — Oracle")
 st.markdown(
@@ -764,7 +759,7 @@ st.markdown(
 st.markdown("<br>", unsafe_allow_html=True)
 
 # =========================
-# TABS: AA / Deuda  (Exportar eliminado)
+#  TABS: AA / Deuda  (Exportar eliminado)
 # =========================
 tabAA, tabDeuda = st.tabs(["Asset Allocation", "Deuda"])
 
@@ -802,7 +797,7 @@ with tabAA:
             )
             st.plotly_chart(fig_top, use_container_width=True, config={"displayModeBar": False})
 
-        # Ranks
+        # Listados tipo ranking
         def render_rank_list(df, name_col):
             if df.empty:
                 st.info("Sin datos.")
@@ -873,7 +868,7 @@ with tabDeuda:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 2) Semáforo
+    # 2) TABLA SEMÁFORO DE RIESGO
     r = (df_det.groupby('Calificación', dropna=False)['% Cartera']
               .apply(lambda s: pd.Series(parse_pct_col(x) for x in s).sum()).reset_index())
     r.columns = ['Escala','Pct']
@@ -882,7 +877,7 @@ with tabDeuda:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 3) Tabla detallada
+    # 3) Tabla general (detalle + TOTAL al final)
     st.subheader("Tabla detallada")
     q = st.text_input("Buscar (instrumento / papel / calificación)", "")
     df_detail = df_final.iloc[:-1].copy()
