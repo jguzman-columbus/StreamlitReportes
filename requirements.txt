@@ -1,5 +1,8 @@
-﻿streamlit==1.39.0
+streamlit==1.39.0
 oracledb==2.4.1
 pandas
 numpy
 plotly
+reportlab 
+kaleido
+psycopg2-binary
