@@ -2067,12 +2067,12 @@ else:
     st.header("Resumen")
     render_resumen()
 
-    st.header("Asset Allocation — General / Detalle / Histórico (Anual)")
+    st.header("Asset Allocation")
     render_allocation_general()
     render_allocation_detalle()
     render_allocation_historico()
 
-    st.header("Deuda — Composición / Riesgo / Hist. Trimestral / Tabla / Por producto / Rendimientos")
+    st.header("Deuda")
     render_deuda_composicion(df_final_deuda)
     render_deuda_riesgo(df_final_deuda)
     render_deuda_historico_trimestral()
@@ -2080,7 +2080,7 @@ else:
     render_deuda_por_producto_comp(df_final_deuda)
     render_deuda_rendimientos_por_producto()
 
-    st.header("Renta Variable — Resumen / Por producto / Evolución 12m / Rendimientos")
+    st.header("Renta Variable")
     render_rv_resumen()
     render_rv_por_producto()
     render_rv_evolucion()
