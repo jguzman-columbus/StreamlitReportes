@@ -1,16 +1,11 @@
 # app.py — Portafolio AA / Deuda / RV (visual pro + históricos + filtros ocultos + rendimientos brutos anualizados)
-# Cambios:
-# - Resumen: KPI "# Contratos (ID_CLIENTE)" por ALIAS
-# - Resumen: donuts y tabla con Top 5 categorías
-# - Pestañas Resumen y Asset Allocation: se consideran todos los productos de todos los tipos de activo
-# - Pestaña Deuda: solo instrumentos de Deuda (ID_TIPO_ACTIVO=1) EXCLUYENDO productos 144 y 149
-# - Pestaña RV: incluye instrumentos con ID_TIPO_ACTIVO=2 + productos 144 y 149
-# - Productos 144 y 149 se consideran Renta Variable a efectos de AA e históricos
-# - AA/Detalle: productos divididos por tipo de activo, selección independiente por Deuda / RV
-# - AA/Histórico: se incluyen todos los años (últimos 5) en las series históricas
-# - Deuda/Composición: reemplazar 'none' -> 'Reporto Guber Excento' en Tipo de instrumento
-# - Deuda/Riesgo: tabla semáforo (verde, amarillo, naranja, rojo) + histórico de duración mensual ponderada
-# - Tablas: estilo "tiny" para minimizar necesidad de scroll
+# Incluye:
+# - Resumen con KPIs + principales holdings (Top 5 + Otros) en barra apilada (% sobre portafolio)
+# - Rendimientos contrato 12m + rendimientos por producto (V_RENDIMIENTO_CTO y V_RENDIMIENTO_PROD)
+# - Asset Allocation general / detalle / histórico (últimos 5 años)
+# - Deuda: composición, riesgo, histórico trimestral, detalle, composición por producto, rendimientos por producto
+# - Renta Variable: resumen, por producto, evolución 12m, rendimientos por producto
+# - Modo impresión sin saltos de página forzados
 
 import re, math, os
 import numpy as np
@@ -83,9 +78,8 @@ def css_global():
       .tabs-normal { display: none !important; }
       .print-container { display: block !important; }
       .block-container { padding: 0 !important; }
+      h1, h2, h3 { margin-top: 0.25in !important; page-break-after: avoid; }
       .element-container, .plotly, .stPlotlyChart, [data-testid="stDataFrame"] { break-inside: avoid; }
-      .page-break { page-break-after: always; }
-      .tiny-table * { font-size: 8px !important; }
     }
     </style>
     """
@@ -107,7 +101,7 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sb-card"><div class="sb-title">Impresión</div>', unsafe_allow_html=True)
-    print_mode = st.checkbox("Vista de impresión (Carta, 1 salto por pestaña)", value=False)
+    print_mode = st.checkbox("Vista de impresión (Carta, sin saltos de página forzados)", value=False)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================
@@ -191,9 +185,6 @@ def get_num_contratos(alias: str) -> int:
     df = run_sql(q, {"a": alias})
     return int(df.iloc[0,0]) if not df.empty else 0
 
-# =========================
-#  Rendimientos (V_RENDIMIENTO_CTO)
-# =========================
 def _col_exists(owner:str, table:str, col:str) -> bool:
     q = """
     SELECT COUNT(*) AS N
@@ -215,27 +206,17 @@ def _to_dec(x):
     except:
         return np.nan
 
+# =========================
+#  Rendimientos contrato 12m
+# =========================
 @st.cache_data(ttl=900, show_spinner=True)
 def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFrame:
     """
-    Histórico de rendimientos brutos a nivel CONTRATO para los últimos 12 meses
-    hasta el mes (anio, mes) seleccionado.
-
-    Devuelve columnas:
-      ANIO, MES,
-      TASA_M_ANUAL        -> TASA (mensual, anualizado)    en decimal 0-1
-      TASA_ACUM_ANUAL     -> TASA_ACUMULADO (YTD anual.)   en decimal 0-1
-      TASA_M_EFEC         -> TASA_EFECTIVA (mensual, efec) en decimal 0-1
-      TASA_ACUM_EFEC      -> TASA_EFECTIVA_ACUMULADO (YTD efec) en decimal 0-1
+    Histórico de rendimientos brutos a nivel CONTRATO para los últimos 12 meses.
     """
-
-    # Mes de referencia
     ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
-
-    # Primer día del mes 11 meses antes
     start = (ref - pd.DateOffset(months=11)).replace(day=1)
-    # Último día del mes seleccionado
-    end = (ref + pd.offsets.MonthEnd(0))
+    end   = (ref + pd.offsets.MonthEnd(0))
 
     sql = """
     WITH CTS AS (
@@ -271,16 +252,8 @@ def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
             "TASA_M_EFEC","TASA_ACUM_EFEC"
         ])
 
-    df = df.copy()
+    df = df.sort_values(["ANIO","MES"]).groupby(["ANIO","MES"], as_index=False).last()
 
-    # Nos quedamos con un registro por mes (si hay más de uno)
-    df = (
-        df.sort_values(["ANIO","MES"])
-          .groupby(["ANIO","MES"], as_index=False)
-          .last()
-    )
-
-    # Pasamos a decimales 0-1 usando _to_dec elemento a elemento
     df["TASA_M_ANUAL"]    = df["TASA"].apply(_to_dec)
     df["TASA_ACUM_ANUAL"] = df["TASA_ACUMULADO"].apply(_to_dec)
     df["TASA_M_EFEC"]     = df["TASA_EFECTIVA"].apply(_to_dec)
@@ -288,6 +261,132 @@ def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
 
     return df[[
         "ANIO","MES",
+        "TASA_M_ANUAL","TASA_ACUM_ANUAL",
+        "TASA_M_EFEC","TASA_ACUM_EFEC"
+    ]]
+
+# =========================
+#  Rendimientos por producto 12m (V_RENDIMIENTO_PROD)
+# =========================
+@st.cache_data(ttl=900, show_spinner=True)
+def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFrame:
+    """
+    Histórico de rendimientos brutos a nivel PRODUCTO (estrategia) para los últimos 12 meses.
+
+    Fuente: SIAPII.V_RENDIMIENTO_PROD
+    Columnas usadas:
+      - TASA
+      - TASA_EFECTIVA
+      - TASA_ACUMULADO
+      - TASA_EFECTIVA_ACUMULADO
+    Filtro:
+      - TIPO_RENDIMIENTO = 'GESTION BRUTA'
+      - Si existe, NIVEL_PRODUCTO = 'SI'
+      - Si existen ID_CDM en contrato y en V_RENDIMIENTO_PROD, filtra por ID_CDM del ALIAS_CDM
+    """
+
+    # Mes de referencia
+    ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
+
+    # Primer día del mes 11 meses antes
+    start = (ref - pd.DateOffset(months=11)).replace(day=1)
+    # Último día del mes seleccionado
+    end = (ref + pd.offsets.MonthEnd(0))
+
+    # Filtro nivel producto si la columna existe
+    tiene_nivel_prod = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'NIVEL_PRODUCTO')
+    filtro_nivel = "AND r.NIVEL_PRODUCTO = 'SI'" if tiene_nivel_prod else ""
+
+    # Revisar si existe ID_CDM en ambas tablas
+    has_idcdm_cto = _col_exists('SIAPII', 'V_M_CONTRATO_CDM', 'ID_CDM')
+    has_idcdm_rp  = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'ID_CDM')
+
+    if has_idcdm_cto and has_idcdm_rp:
+        # ✅ Camino ideal: filtrar rendimientos directamente por ID_CDM del cliente
+        sql = f"""
+        WITH CTS AS (
+            SELECT DISTINCT ID_CDM
+            FROM SIAPII.V_M_CONTRATO_CDM
+            WHERE ALIAS_CDM = :alias
+        )
+        SELECT
+            r.ANIO,
+            r.MES,
+            r.ID_PRODUCTO,
+            COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
+            r.TASA,
+            r.TASA_EFECTIVA,
+            r.TASA_ACUMULADO,
+            r.TASA_EFECTIVA_ACUMULADO
+        FROM SIAPII.V_RENDIMIENTO_PROD r
+        JOIN CTS c
+          ON c.ID_CDM = r.ID_CDM
+        LEFT JOIN SIAPII.V_M_PRODUCTO p
+          ON p.ID_PRODUCTO = r.ID_PRODUCTO
+        WHERE UPPER(r.TIPO_RENDIMIENTO) = 'GESTION BRUTA'
+          {filtro_nivel}
+          AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
+              BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
+        """
+    else:
+        # 🟡 Fallback: filtrar solo por productos ligados al alias vía V_CLIENTE_ESTADISTICAS
+        # (como lo teníamos antes, por si en tu ambiente no está ID_CDM)
+        sql = f"""
+        WITH PROD_ALIAS AS (
+            SELECT DISTINCT e.ID_PRODUCTO
+            FROM SIAPII.V_CLIENTE_ESTADISTICAS e
+            JOIN SIAPII.V_M_CONTRATO_CDM c
+              ON c.ID_CLIENTE = e.ID_CLIENTE
+            WHERE c.ALIAS_CDM = :alias
+        )
+        SELECT
+            r.ANIO,
+            r.MES,
+            r.ID_PRODUCTO,
+            COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
+            r.TASA,
+            r.TASA_EFECTIVA,
+            r.TASA_ACUMULADO,
+            r.TASA_EFECTIVA_ACUMULADO
+        FROM SIAPII.V_RENDIMIENTO_PROD r
+        JOIN PROD_ALIAS pa
+          ON pa.ID_PRODUCTO = r.ID_PRODUCTO
+        LEFT JOIN SIAPII.V_M_PRODUCTO p
+          ON p.ID_PRODUCTO = r.ID_PRODUCTO
+        WHERE UPPER(r.TIPO_RENDIMIENTO) = 'GESTION BRUTA'
+          {filtro_nivel}
+          AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
+              BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
+        """
+
+    df = run_sql(sql, {
+        "alias": alias,
+        "d_ini": start.strftime("%Y-%m-%d"),
+        "d_fin": end.strftime("%Y-%m-%d"),
+    })
+
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "ANIO","MES","ID_PRODUCTO","PRODUCTO",
+            "TASA_M_ANUAL","TASA_ACUM_ANUAL",
+            "TASA_M_EFEC","TASA_ACUM_EFEC"
+        ])
+
+    # Un registro por mes-producto
+    df = (
+        df.sort_values(["ANIO", "MES", "ID_PRODUCTO"])
+          .groupby(["ANIO", "MES", "ID_PRODUCTO", "PRODUCTO"], as_index=False)
+          .last()
+    )
+
+    # Pasar a decimales 0–1 EXACTAMENTE igual que en contrato
+    df["TASA_M_ANUAL"]    = df["TASA"].apply(_to_dec)
+    df["TASA_M_EFEC"]     = df["TASA_EFECTIVA"].apply(_to_dec)
+    df["TASA_ACUM_ANUAL"] = df["TASA_ACUMULADO"].apply(_to_dec)
+    df["TASA_ACUM_EFEC"]  = df["TASA_EFECTIVA_ACUMULADO"].apply(_to_dec)
+
+    return df[[
+        "ANIO","MES","ID_PRODUCTO","PRODUCTO",
         "TASA_M_ANUAL","TASA_ACUM_ANUAL",
         "TASA_M_EFEC","TASA_ACUM_EFEC"
     ]]
@@ -426,13 +525,14 @@ def aa_hist_ultimo_5_anios(alias: str):
     if df.empty:
         return (pd.DataFrame(columns=["ANIO","ACTIVO","MONTO","Pct"]),
                 pd.DataFrame(columns=["ANIO","PRODUCTO","MONTO","Pct"]))
-    aa_activo = (df.groupby(["ANIO","ACTIVO"], dropna=False)["MONTO"].sum().reset_index())
+
+    aa_activo = df.groupby(["ANIO","ACTIVO"], dropna=False)["MONTO"].sum().reset_index()
     tot = aa_activo.groupby("ANIO")["MONTO"].sum().rename("TOT")
     aa_activo = aa_activo.merge(tot, on="ANIO", how="left")
     aa_activo["Pct"] = (aa_activo["MONTO"] / aa_activo["TOT"] * 100).round(2)
     aa_activo = aa_activo.drop(columns=["TOT"])
 
-    aa_producto = (df.groupby(["ANIO","PRODUCTO"], dropna=False)["MONTO"].sum().reset_index())
+    aa_producto = df.groupby(["ANIO","PRODUCTO"], dropna=False)["MONTO"].sum().reset_index()
     tot2 = aa_producto.groupby("ANIO")["MONTO"].sum().rename("TOT")
     aa_producto = aa_producto.merge(tot2, on="ANIO", how="left")
     aa_producto["Pct"] = (aa_producto["MONTO"] / aa_producto["TOT"] * 100).round(2)
@@ -723,13 +823,11 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
         '_ID_PRODUCTO'        : df['ID_PRODUCTO']
     })
 
-    # Adjuntar nombre de Producto
     mp = map_productos()
     df_final = df_final.merge(mp, left_on="_ID_PRODUCTO", right_on="ID_PRODUCTO", how="left")
     df_final.drop(columns=["ID_PRODUCTO"], inplace=True, errors="ignore")
     df_final.rename(columns={"PRODUCTO": "Producto"}, inplace=True)
 
-    # Orden
     ord_tp = {'Reporto':1,'Gubernamental':2,'CuasiGuber':3,'Banca Comercial':4,'Privado':5}
     is_rep2 = df_final['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
               df_final['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
@@ -740,12 +838,10 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
                  .drop(columns=['__ord__','__m__'])
                  .reset_index(drop=True))
 
-    # Calificación para reportos
     mask_rep_det = df_detail['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
                    df_detail['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
     df_detail.loc[mask_rep_det, 'Calificación'] = 'MXAAA'
 
-    # Fila TOTAL (sin producto)
     if len(df_detail):
         row_total = {
             'Producto':'','Tipo de Papel':'','Tipo de instrumento':'','Instrumento':'TOTAL','Fecha vto':'',
@@ -832,7 +928,6 @@ def rv_snapshot_por_producto(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Tim
 
 # =========================
 #  HISTÓRICO por TRIMESTRES (Tipo de Papel / Tipo de Instrumento) — desde 2020
-#  Clasificando 144/149 como RV (ID_ACTIVO_LOGICO=2)
 # =========================
 @st.cache_data(ttl=3600, show_spinner=True)
 def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
@@ -882,8 +977,8 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
     df = df.rename(columns={"PCT": "Pct"})
     df["Pct"] = pd.to_numeric(df["Pct"], errors="coerce").fillna(0.0)
 
-    por_papel = (df.groupby(["PERIODO","TIPO_PAPEL"], dropna=False)["Pct"].sum().reset_index())
-    por_instr = (df.groupby(["PERIODO","TIPO_INSTRUMENTO"], dropna=False)["Pct"].sum().reset_index())
+    por_papel = df.groupby(["PERIODO","TIPO_PAPEL"], dropna=False)["Pct"].sum().reset_index()
+    por_instr = df.groupby(["PERIODO","TIPO_INSTRUMENTO"], dropna=False)["Pct"].sum().reset_index()
 
     def _key(p):
         y, q = p.split("-Q")
@@ -893,34 +988,22 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
 
     return por_papel, por_instr
 
-# ======= Histórico mensual de duración ponderada (Deuda) — usando el mismo proceso que el snapshot =======
+# ======= Histórico mensual de duración ponderada (Deuda) =======
 @st.cache_data(ttl=1800, show_spinner=True)
 def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.Timestamp) -> pd.DataFrame:
-    """
-    Calcula la duración ponderada (en días) por mes para los últimos 12 meses
-    hasta el mes de f_ref_fin, usando exactamente el mismo flujo que la tabla de Deuda:
-      - query_snapshot_deuda(alias, F_DIA_INI_mes, F_DIA_FIN_NEXT_mes)
-      - build_df_final(df_snap, inflacion_anual)
-      - fila TOTAL -> 'Duración (días)'
-    """
     filas = []
-
-    # Tomamos los últimos 12 meses hasta el mes de referencia (incluyéndolo)
     ref_period = f_ref_fin.to_period("M")
     for k in range(11, -1, -1):
         periodo = ref_period - k
-        mes_end = periodo.to_timestamp("M")          # último día del mes
-        mes_ini = mes_end.replace(day=1)            # primer día del mes
+        mes_end = periodo.to_timestamp("M")
+        mes_ini = mes_end.replace(day=1)
         mes_end_next = mes_end + pd.Timedelta(days=1)
 
-        # Snapshot de deuda para ese mes
         df_snap = query_snapshot_deuda(alias, mes_ini, mes_end_next)
         df_det = build_df_final(df_snap, inflacion_anual)
-
         if df_det is None or df_det.empty:
             continue
 
-        # Fila TOTAL (igual que en la tabla)
         total_row = df_det[df_det["Instrumento"].astype(str).str.upper() == "TOTAL"].tail(1)
         if total_row.empty:
             continue
@@ -929,16 +1012,11 @@ def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.T
         if pd.isna(dur):
             continue
 
-        filas.append({
-            "MES": mes_end,
-            "DURACION_DIAS": float(dur)
-        })
+        filas.append({"MES": mes_end, "DURACION_DIAS": float(dur)})
 
     if not filas:
         return pd.DataFrame(columns=["MES", "DURACION_DIAS"])
-
     return pd.DataFrame(filas).sort_values("MES").reset_index(drop=True)
-
 
 # =========================
 #  CONSULTAS BASE / PARAMS (corte y listas)
@@ -967,10 +1045,8 @@ with st.spinner("Consultando Oracle / Postgres y construyendo vistas…"):
 
 # Rendimientos
 cto_m_anual, cto_ytd_anual, df_rend_prod = rend_bruto_contrato_y_producto(ALIAS_CDM, y, m)
-
-# Histórico de rendimientos 12m para la gráfica de Resumen
-df_hist_rend = rend_bruto_contrato_hist_12m(ALIAS_CDM, y, m)
-
+df_hist_rend      = rend_bruto_contrato_hist_12m(ALIAS_CDM, y, m)
+df_hist_rend_prod = rend_bruto_producto_hist_12m(ALIAS_CDM, y, m)
 
 # Snapshot Deuda
 with st.spinner("Calculando Deuda…"):
@@ -983,6 +1059,11 @@ core_map_df = core_issuer_map()
 rv_enriq_base = pd.DataFrame()
 if not rv_df_raw.empty:
     rv_enriq_base = rv_df_raw.merge(core_map_df, left_on="NOMBRE_EMISORA", right_on="issuer_name", how="left")
+
+    mp_rv = map_productos()
+    rv_enriq_base = rv_enriq_base.merge(mp_rv[["ID_PRODUCTO","PRODUCTO"]], on="ID_PRODUCTO", how="left")
+    rv_enriq_base.rename(columns={"PRODUCTO": "Producto"}, inplace=True)
+
     rv_enriq_base["industry"] = rv_enriq_base["industry"].fillna("SIN INDUSTRIA")
     rv_enriq_base["sector"] = rv_enriq_base["sector"].fillna("SIN SECTOR")
     rv_enriq_base["Nombre Completo"] = rv_enriq_base.get("Nombre Completo", rv_enriq_base["NOMBRE_EMISORA"].astype(str))
@@ -993,10 +1074,10 @@ hist_deuda_papel, hist_deuda_instr = hist_trimestral_papel_instrumento(ALIAS_CDM
 hist_rv_papel,    hist_rv_instr    = hist_trimestral_papel_instrumento(ALIAS_CDM, 2)
 hist_dur = deuda_duracion_historico(ALIAS_CDM, INFLACION_ANUAL, F_DIA_FIN)
 
-
 # =========================
 #  TÍTULO
 # =========================
+st.markdown("<br>", unsafe_allow_html=True)  # pequeño margen superior extra
 NOMBRE_CLIENTE = get_nombre_cliente(ALIAS_CDM)
 st.title(f"REPORTE {NOMBRE_CLIENTE}")
 st.markdown(
@@ -1010,7 +1091,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 # =========================
 #  VISUALES BÁSICOS
 # =========================
-def donut_figure(labels, values, title: str, height=400, top_n: int | None = None) -> go.Figure:
+def donut_figure(labels, values, title: str, height=400, top_n: int | None = None, kind: str = "money") -> go.Figure:
     vals = pd.to_numeric(pd.Series(values), errors='coerce').fillna(0.0).values
     labs = pd.Series(labels).astype(str).values
     total = float(np.nansum(vals))
@@ -1021,26 +1102,38 @@ def donut_figure(labels, values, title: str, height=400, top_n: int | None = Non
         labs, vals = labs[order], vals[order]
         if top_n is not None and top_n > 0:
             labs, vals = labs[:top_n], vals[:top_n]
+
+    if kind == "money":
+        textinfo = "percent"
+        texttemplate = "%{percent:.1%}"
+        hovertemplate = "%{label}<br>$%{value:,.0f} (%{percent:.1%})<extra></extra>"
+        annot_text = f"Total<br>${total:,.0f}"
+    else:  # pct
+        textinfo = "label+text"
+        texttemplate = "%{value:.1f}%"
+        hovertemplate = "%{label}<br>%{value:.2f}%<extra></extra>"
+        annot_text = f"Total<br>{total:.1f}%"
+
     fig = go.Figure(data=[go.Pie(
         labels=labs, values=vals, hole=.55, sort=False,
-        textinfo="percent", texttemplate="%{percent:.1%}",
-        hovertemplate="%{label}<br>$%{value:,.0f} (%{percent:.1%})<extra></extra>"
+        textinfo=textinfo, texttemplate=texttemplate,
+        hovertemplate=hovertemplate
     )])
     fig.update_layout(
         title=title, showlegend=True, legend=LEGEND_RIGHT,
         margin=dict(l=10, r=220, t=42, b=6),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color='#0f172a'), height=height,
-        annotations=[dict(text=f"Total<br>${total:,.0f}", x=0.5, y=0.5, font=dict(size=12), showarrow=False)]
+        annotations=[dict(text=annot_text, x=0.5, y=0.5, font=dict(size=12), showarrow=False)]
     )
     return fig
 
-def area100_from_pivot(pvt: pd.DataFrame, title: str, height=BARH_H):
+def area100_from_pivot(pvt: pd.DataFrame, title: str, height=BARH_H, tickvals=None):
     if pvt.empty:
         fig = go.Figure()
         fig.update_layout(title=title, height=height)
         return fig
-    ord_cols = (pvt.mean(axis=0).sort_values(ascending=False).index.tolist())
+    ord_cols = pvt.mean(axis=0).sort_values(ascending=False).index.tolist()
     pvt = pvt[ord_cols]
     fig = go.Figure()
     for col in pvt.columns:
@@ -1048,10 +1141,14 @@ def area100_from_pivot(pvt: pd.DataFrame, title: str, height=BARH_H):
             x=pvt.index, y=pvt[col], mode="lines", stackgroup="one", groupnorm="percent",
             name=str(col), hovertemplate="%{x}<br>%{y:.2f}%<extra></extra>"
         ))
+    xaxis_args = dict(title="Periodo", tickangle=TICKANGLE)
+    if tickvals is not None:
+        xaxis_args["tickmode"] = "array"
+        xaxis_args["tickvals"] = tickvals
     fig.update_layout(
         title=title,
         yaxis=dict(title="% cartera", range=[0,100], ticksuffix="%"),
-        xaxis=dict(title="Periodo", tickangle=TICKANGLE),
+        xaxis=xaxis_args,
         legend=LEGEND_RIGHT,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=220, t=42, b=6),
@@ -1060,21 +1157,81 @@ def area100_from_pivot(pvt: pd.DataFrame, title: str, height=BARH_H):
     return fig
 
 # =========================
+#  HELPER RENDIMIENTOS POR PRODUCTO (gráfica)
+# =========================
+def plot_rend_producto_series(df_hist_prod: pd.DataFrame, producto: str, modo: str, titulo_prefix: str):
+    dfp = df_hist_prod[df_hist_prod["PRODUCTO"] == producto].copy()
+    if dfp.empty:
+        st.info("Sin rendimientos disponibles para este producto.")
+        return
+
+    dfp = dfp.sort_values(["ANIO","MES"])
+    fechas = pd.to_datetime(dict(year=dfp["ANIO"], month=dfp["MES"], day=1), errors="coerce")
+    dfp["LABEL"] = fechas.dt.strftime("%b-%y")
+
+    if modo == "Anualizado":
+        col_m = "TASA_M_ANUAL"
+        col_a = "TASA_ACUM_ANUAL"
+    else:
+        col_m = "TASA_M_EFEC"
+        col_a = "TASA_ACUM_EFEC"
+
+    m_vals = (dfp[col_m] * 100.0).round(2)
+    a_vals = (dfp[col_a] * 100.0).round(2)
+
+    x_labels = dfp["LABEL"].tolist()
+    m_vals_list = m_vals.tolist()
+    a_vals_list = a_vals.tolist()
+
+    sel = dfp[(dfp["ANIO"] == y) & (dfp["MES"] == m)]
+    ytd_val = np.nan
+    if not sel.empty and pd.notna(sel[col_a].iloc[0]):
+        ytd_val = float(sel[col_a].iloc[0] * 100.0)
+
+    x_labels_ext = x_labels + [f"Año {y}"]
+    m_vals_ext = m_vals_list + [np.nan]
+    a_vals_ext = a_vals_list + [ytd_val]
+
+    text_m = [f"{v:.2f}%" if isinstance(v, (int,float)) and not np.isnan(v) else "" for v in m_vals_ext]
+    text_a = [f"{v:.2f}%" if isinstance(v, (int,float)) and not np.isnan(v) else "" for v in a_vals_ext]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_labels_ext,
+        y=m_vals_ext,
+        name="Mensual",
+        hovertemplate="%{x}<br>Mensual: %{y:.2f}%<extra></extra>",
+        text=text_m,
+        textposition="outside"
+    ))
+    fig.add_trace(go.Bar(
+        x=x_labels_ext,
+        y=a_vals_ext,
+        name="Acumulado",
+        hovertemplate="%{x}<br>Acumulado: %{y:.2f}%<extra></extra>",
+        text=text_a,
+        textposition="outside"
+    ))
+
+    fig.update_layout(
+        barmode="group",
+        title=f"{titulo_prefix} — {producto}",
+        yaxis=dict(title="Rendimiento (%)"),
+        xaxis=dict(title="Mes", tickangle=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+        margin=dict(l=10, r=10, t=60, b=40),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=BARH_H
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+# =========================
 #  RENDER SECCIONES
 # =========================
 def render_resumen():
     # ======================
-    # Selector de tipo de rendimiento
-    # ======================
-    modo = st.radio(
-        "Tipo de rendimiento bruto mostrado",
-        ["Anualizado", "Efectivo"],
-        horizontal=True,
-        index=0
-    )
-
-    # ======================
-    # KPIs básicos de portafolio (igual que antes)
+    # KPIs básicos de portafolio (no dependen del modo)
     # ======================
     total_port = float(df_aa_activo["Monto"].sum()) if len(df_aa_activo) else 0.0
     n_productos = int(df_aa_producto["PRODUCTO"].nunique()) if len(df_aa_producto) else 0
@@ -1088,40 +1245,29 @@ def render_resumen():
     top_prod_pct = float(top_prod_row["Porcentaje"].iloc[0]) if not top_prod_row.empty else 0.0
     top_prod_mnt = float(top_prod_row["Monto"].iloc[0]) if not top_prod_row.empty else 0.0
 
-    # ======================
-    # KPIs de rendimientos (mes y acumulado año) desde df_hist_rend
-    # ======================
+    # Rendimientos del contrato (usamos anualizados para los KPIs)
     kpi_rend_mes = "—"
     kpi_rend_ytd = "—"
-
     if df_hist_rend is not None and not df_hist_rend.empty:
         sel = df_hist_rend[(df_hist_rend["ANIO"] == y) & (df_hist_rend["MES"] == m)]
         if not sel.empty:
             row = sel.iloc[0]
-            if modo == "Anualizado":
-                v_m = row["TASA_M_ANUAL"]
-                v_y = row["TASA_ACUM_ANUAL"]
-            else:
-                v_m = row["TASA_M_EFEC"]
-                v_y = row["TASA_ACUM_EFEC"]
-
+            v_m = row["TASA_M_ANUAL"]
+            v_y = row["TASA_ACUM_ANUAL"]
             if pd.notna(v_m):
                 kpi_rend_mes = f"{v_m * 100:.2f}%"
             if pd.notna(v_y):
                 kpi_rend_ytd = f"{v_y * 100:.2f}%"
 
-    label_mes = "Rend. mensual (anualizado)" if modo == "Anualizado" else "Rend. mensual (efectivo)"
-    label_ytd = "Rend. acum. año (anualizado)" if modo == "Anualizado" else "Rend. acum. año (efectivo)"
-
     resumen_vals = {
         "Total Portafolio": f"${total_port:,.2f}",
         "# Contratos": f"{n_contratos:,}",
-        "No. Productos": f"{n_productos:,}",
-        "Top Producto": top_prod_nom,
+        "No. Estrategias": f"{n_productos:,}",
+        "Top Estrategia": top_prod_nom,
         "Top %": f"{top_prod_pct:.2f}%",
         "Top Monto": f"${top_prod_mnt:,.2f}",
-        label_mes: kpi_rend_mes,
-        label_ytd: kpi_rend_ytd,
+        "Rend. mensual (anualizado)": kpi_rend_mes,
+        "Rend. acum. año (anualizado)": kpi_rend_ytd,
     }
 
     st.markdown(
@@ -1137,10 +1283,11 @@ def render_resumen():
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ======================
-    # Donut combinado (igual que antes)
+    # Principales holdings (TOP 5) – barra apilada sobre el TOTAL del portafolio
     # ======================
     c1, c2 = st.columns((1, 1))
 
+    # RV: por industria
     rv_series = pd.Series(dtype=float)
     if not rv_enriq_base.empty:
         rv_series = (
@@ -1148,6 +1295,7 @@ def render_resumen():
             .rename_axis("Categoria").astype(float)
         )
 
+    # Deuda: por tipo de instrumento (desde df_final_deuda)
     deuda_series = pd.Series(dtype=float)
     if not df_final_deuda.empty:
         mask_det = df_final_deuda["Instrumento"].astype(str).str.upper() != "TOTAL"
@@ -1159,9 +1307,11 @@ def render_resumen():
             tmp["% Cartera"].str.replace("%", "", regex=False),
             errors="coerce"
         ).fillna(0.0)
-        deuda_series = pct_num.groupby(tmp["Tipo de instrumento"]).sum()
+        # pct_num está en %, lo convertimos a monto usando el total del portafolio
         if total_port > 0:
-            deuda_series = deuda_series / 100.0 * total_port
+            deuda_series = (pct_num / 100.0 * total_port).groupby(tmp["Tipo de instrumento"]).sum()
+        else:
+            deuda_series = pct_num.groupby(tmp["Tipo de instrumento"]).sum()
         deuda_series.index = deuda_series.index.astype(str)
 
     combined = pd.concat([
@@ -1169,38 +1319,78 @@ def render_resumen():
         deuda_series.rename(lambda x: f"DEUDA · {x}")
     ]).groupby(level=0).sum().sort_values(ascending=False)
 
+    # SOLO TOP 5, SIN GRUPO "OTROS"
     combined_top = combined.head(5)
 
     with c1:
-        st.plotly_chart(
-            donut_figure(
-                combined_top.index.tolist(),
-                combined_top.values.tolist(),
-                "Mejores 5 productos del portafolio",
-                height=CHART_H,
-                top_n=5
-            ),
-            use_container_width=True,
-            config={"displayModeBar": False}
-        )
+        if total_port <= 0 or len(combined_top) == 0:
+            st.info("Sin datos suficientes para los principales holdings del portafolio.")
+        else:
+            etiquetas = combined_top.index.tolist()
+            montos = combined_top.values.astype(float)
+            pct_sobre_total = (montos / total_port * 100.0)
+
+            # El eje Y se ajusta al máximo de los top 5 (no a 100%)
+            max_y = float(pct_sobre_total.max() * 1.15) if len(pct_sobre_total) else 100.0
+
+            fig_hold = go.Figure()
+            for lab, pct in zip(etiquetas, pct_sobre_total):
+                fig_hold.add_trace(go.Bar(
+                    x=["Portafolio"],
+                    y=[pct],
+                    name=lab,
+                    text=[f"{pct:.2f}%"],
+                    textposition="inside",
+                    hovertemplate="%{label}<br>% Portafolio: %{y:.2f}%<extra></extra>",
+                ))
+
+            fig_hold.update_layout(
+                barmode="stack",
+                title="Principales holdings del portafolio (Top 5)",
+                yaxis=dict(
+                    title="% del portafolio",
+                    ticksuffix="%",
+                    range=[0, 100]  # SIEMPRE 0–100%, aunque los Top 5 sumen menos
+                ),
+                xaxis=dict(title=""),
+                legend=LEGEND_RIGHT,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=220, t=42, b=6),
+                height=CHART_H
+            )
+
+            st.plotly_chart(fig_hold, use_container_width=True, config={"displayModeBar": False})
 
     with c2:
-        if len(combined_top) == 0:
-            st.info("Sin datos para la distribución combinada.")
+        if len(combined_top) == 0 or total_port <= 0:
+            st.info("Sin datos para el detalle de holdings.")
         else:
             df_donut = combined_top.reset_index()
             df_donut.columns = ["Categoría", "Monto"]
-            df_donut["%"] = (df_donut["Monto"] / df_donut["Monto"].sum() * 100).round(2)
+            df_donut["% Portafolio"] = (df_donut["Monto"] / total_port * 100).round(2)
             df_donut["Monto"] = df_donut["Monto"].map(lambda x: f"${x:,.2f}")
-            df_donut["%"] = df_donut["%"].map(lambda x: f"{x:.2f}%")
-            st.markdown("**Detalle**")
+            df_donut["% Portafolio"] = df_donut["% Portafolio"].map(lambda x: f"{x:.2f}%")
+            st.markdown("**Detalle Top 5 holdings**")
             st.markdown('<div class="tiny-table">', unsafe_allow_html=True)
             st.dataframe(df_donut, hide_index=True, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # ======================
-    # Gráfica de rendimientos 12m (mensual vs acumulado + barra Año Y)
+    # Gráfica de rendimientos 12m (selector dentro del bloque)
     # ======================
+    st.markdown("### Rendimiento bruto del contrato")
+
+    modo = st.radio(
+        "Tipo de rendimiento bruto mostrado",
+        ["Anualizado", "Efectivo"],
+        horizontal=True,
+        index=0,
+        key="modo_rend_resumen"
+    )
+
     if df_hist_rend is None or df_hist_rend.empty:
         st.caption("No hay información de rendimientos brutos para los últimos 12 meses.")
     else:
@@ -1214,11 +1404,9 @@ def render_resumen():
         if modo == "Anualizado":
             col_m = "TASA_M_ANUAL"
             col_a = "TASA_ACUM_ANUAL"
-            titulo = "Rendimiento bruto anualizado"
         else:
             col_m = "TASA_M_EFEC"
             col_a = "TASA_ACUM_EFEC"
-            titulo = "Rendimiento bruto efectivo — últimos 12 meses"
 
         m_vals = (dfh[col_m] * 100.0).round(2)
         a_vals = (dfh[col_a] * 100.0).round(2)
@@ -1229,31 +1417,37 @@ def render_resumen():
 
         # YTD: acumulado del año hasta el mes seleccionado
         ytd_val = np.nan
-        sel = dfh[(dfh["ANIO"] == y) & (dfh["MES"] == m)]
-        if not sel.empty and pd.notna(sel[col_a].iloc[0]):
-            ytd_val = float(sel[col_a].iloc[0] * 100.0)
+        sel_y = dfh[(dfh["ANIO"] == y) & (dfh["MES"] == m)]
+        if not sel_y.empty and pd.notna(sel_y[col_a].iloc[0]):
+            ytd_val = float(sel_y[col_a].iloc[0] * 100.0)
 
         x_labels_ext = x_labels + [f"Año {y}"]
         m_vals_ext = m_vals_list + [np.nan]  # sin barra mensual en el total año
         a_vals_ext = a_vals_list + [ytd_val]
+
+        text_m = [f"{v:.2f}%" if isinstance(v, (int, float)) and not np.isnan(v) else "" for v in m_vals_ext]
+        text_a = [f"{v:.2f}%" if isinstance(v, (int, float)) and not np.isnan(v) else "" for v in a_vals_ext]
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=x_labels_ext,
             y=m_vals_ext,
             name="Mensual",
-            hovertemplate="%{x}<br>Mensual: %{y:.2f}%<extra></extra>"
+            hovertemplate="%{x}<br>Mensual: %{y:.2f}%<extra></extra>",
+            text=text_m,
+            textposition="outside"
         ))
         fig.add_trace(go.Bar(
             x=x_labels_ext,
             y=a_vals_ext,
             name="Acumulado",
-            hovertemplate="%{x}<br>Acumulado: %{y:.2f}%<extra></extra>"
+            hovertemplate="%{x}<br>Acumulado: %{y:.2f}%<extra></extra>",
+            text=text_a,
+            textposition="outside"
         ))
 
         fig.update_layout(
             barmode="group",
-            title=titulo,
             yaxis=dict(title="Rendimiento (%)"),
             xaxis=dict(title="Mes", tickangle=0),
             legend=dict(
@@ -1275,7 +1469,6 @@ def render_resumen():
     # ======================
     if df_rend_prod is not None and len(df_rend_prod):
         vista = df_rend_prod.copy()
-        # df_rend_prod viene en %, sólo formateamos
         vista["Mensual Anualizado"] = vista["Mensual Anualizado"].map(lambda x: f"{x:.2f}%")
         vista["Acum Anualizado"] = vista["Acum Anualizado"].map(lambda x: f"{x:.2f}%")
         st.markdown("**Rendimiento bruto anualizado por producto (si aplica)**")
@@ -1299,20 +1492,19 @@ def render_allocation_general():
         st.info("Sin productos en el periodo seleccionado.")
         return
 
-    serie_prod = (df_aa_producto.groupby("PRODUCTO")["Monto"].sum()
-                  .sort_values(ascending=False))
+    serie_prod = df_aa_producto.groupby("PRODUCTO")["Monto"].sum().sort_values(ascending=False)
     total_monto = float(serie_prod.sum())
 
     c1, c2 = st.columns((1,1))
     with c1:
         st.plotly_chart(
             donut_figure(serie_prod.index.tolist(), serie_prod.values.tolist(),
-                         "Distribución por Producto"),
+                         "Distribución por estrategia"),
             use_container_width=True, config={"displayModeBar": False}
         )
     with c2:
         df_tab = serie_prod.reset_index()
-        df_tab.columns = ["Producto","Monto"]
+        df_tab.columns = ["Estrategia","Monto"]
         df_tab["%"] = (df_tab["Monto"]/total_monto*100).round(2)
         df_tab["Monto"] = df_tab["Monto"].map(lambda x: f"${x:,.2f}")
         df_tab["%"] = df_tab["%"].map(lambda x: f"{x:.2f}%")
@@ -1322,19 +1514,19 @@ def render_allocation_general():
         st.markdown('</div>', unsafe_allow_html=True)
 
 def render_allocation_detalle():
-    st.subheader("Distribución por producto:")
+    st.subheader("Distribución por estrategia")
     prod_deuda = df_aa_producto[df_aa_producto["ACTIVO"]=="Deuda"]["PRODUCTO"].dropna().unique().tolist()
     prod_rv    = df_aa_producto[df_aa_producto["ACTIVO"]=="Renta Variable"]["PRODUCTO"].dropna().unique().tolist()
 
     c1, c2 = st.columns(2)
     with c1:
-        sel_prod_deuda = st.multiselect("Productos — Deuda", options=prod_deuda, default=prod_deuda[:min(6, len(prod_deuda))])
+        sel_prod_deuda = st.multiselect("Estrategia — Deuda", options=prod_deuda, default=prod_deuda[:min(6, len(prod_deuda))])
         det_d = df_aa_producto[(df_aa_producto["ACTIVO"]=="Deuda") & (df_aa_producto["PRODUCTO"].isin(sel_prod_deuda))].copy()
         if det_d.empty:
             st.info("Selecciona al menos un producto Deuda.")
         else:
             det_d = det_d.groupby("PRODUCTO")["Monto"].sum().reset_index().sort_values("Monto", ascending=False)
-            st.plotly_chart(donut_figure(det_d["PRODUCTO"], det_d["Monto"], "Deuda — Productos seleccionados"),
+            st.plotly_chart(donut_figure(det_d["PRODUCTO"], det_d["Monto"], "Deuda — Estrategias seleccionadas"),
                             use_container_width=True, config={"displayModeBar": False})
             vista = det_d.copy()
             vista["%"] = (vista["Monto"]/vista["Monto"].sum()*100).round(2)
@@ -1345,13 +1537,13 @@ def render_allocation_detalle():
             st.markdown('</div>', unsafe_allow_html=True)
 
     with c2:
-        sel_prod_rv = st.multiselect("Productos — Renta Variable", options=prod_rv, default=prod_rv[:min(6, len(prod_rv))])
+        sel_prod_rv = st.multiselect("Estrategia — Renta Variable", options=prod_rv, default=prod_rv[:min(6, len(prod_rv))])
         det_r = df_aa_producto[(df_aa_producto["ACTIVO"]=="Renta Variable") & (df_aa_producto["PRODUCTO"].isin(sel_prod_rv))].copy()
         if det_r.empty:
             st.info("Selecciona al menos un producto RV.")
         else:
             det_r = det_r.groupby("PRODUCTO")["Monto"].sum().reset_index().sort_values("Monto", ascending=False)
-            st.plotly_chart(donut_figure(det_r["PRODUCTO"], det_r["Monto"], "Capitales — Productos seleccionados"),
+            st.plotly_chart(donut_figure(det_r["PRODUCTO"], det_r["Monto"], "Capitales — Estrategias seleccionadas"),
                             use_container_width=True, config={"displayModeBar": False})
             vista = det_r.copy()
             vista["%"] = (vista["Monto"]/vista["Monto"].sum()*100).round(2)
@@ -1362,7 +1554,7 @@ def render_allocation_detalle():
             st.markdown('</div>', unsafe_allow_html=True)
 
 def render_allocation_historico():
-    st.subheader("Comportamiento de Activos y Productos")
+    st.subheader("Comportamiento de activos y estrategias")
     aa_activo, aa_producto = aa_hist_ultimo_5_anios(ALIAS_CDM)
 
     c1, c2 = st.columns((1,1))
@@ -1373,7 +1565,8 @@ def render_allocation_historico():
             p = aa_activo.copy()
             p["AX"] = p["ANIO"].astype(str)
             pivot_pp = p.pivot_table(index="AX", columns="ACTIVO", values="Pct", aggfunc="sum").fillna(0)
-            st.plotly_chart(area100_from_pivot(pivot_pp, "Activos"),
+            tickvals = pivot_pp.index.tolist()
+            st.plotly_chart(area100_from_pivot(pivot_pp, "Activos", tickvals=tickvals),
                             use_container_width=True, config={"displayModeBar": False})
     with c2:
         if aa_producto.empty:
@@ -1385,18 +1578,18 @@ def render_allocation_historico():
             p2 = aa_producto[aa_producto["PRODUCTO"].isin(top_cols)].copy()
             p2["AX"] = p2["ANIO"].astype(str)
             pivot_p2 = p2.pivot_table(index="AX", columns="PRODUCTO", values="Pct", aggfunc="sum").fillna(0)
-            st.plotly_chart(area100_from_pivot(pivot_p2, "Productos"),
+            tickvals2 = pivot_p2.index.tolist()
+            st.plotly_chart(area100_from_pivot(pivot_p2, "Productos", tickvals=tickvals2),
                             use_container_width=True, config={"displayModeBar": False})
 
 def render_deuda_composicion(df_final):
-    st.subheader("Composición")
+    st.subheader("Composición de activos deuda")
     if df_final.empty:
         st.info("Sin instrumentos de Deuda en el corte actual.")
         return
     mask_det = df_final['Instrumento'].astype(str).str.upper() != 'TOTAL'
     df_det = df_final.loc[mask_det].copy()
 
-    # Reemplazo solicitado
     df_det['Tipo de instrumento'] = df_det['Tipo de instrumento'].replace(
         {None: 'Reporto Guber Excento', 'none': 'Reporto Guber Excento', 'None': 'Reporto Guber Excento'}
     )
@@ -1407,11 +1600,25 @@ def render_deuda_composicion(df_final):
 
     c1, c2 = st.columns((1,1))
     with c1:
-        st.plotly_chart(donut_figure(serie_tp.index.tolist(), serie_tp.values.tolist(), "Por Tipo de Papel"),
-                        use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(
+            donut_figure(
+                serie_tp.index.tolist(),
+                serie_tp.values.tolist(),
+                "Por Tipo de Papel",
+                kind="pct"
+            ),
+            use_container_width=True, config={"displayModeBar": False}
+        )
     with c2:
-        st.plotly_chart(donut_figure(serie_ti.index.tolist(), serie_ti.values.tolist(), "Por Tipo de Instrumento"),
-                        use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(
+            donut_figure(
+                serie_ti.index.tolist(),
+                serie_ti.values.tolist(),
+                "Por Tipo de Instrumento",
+                kind="pct"
+            ),
+            use_container_width=True, config={"displayModeBar": False}
+        )
 
 def render_deuda_riesgo(df_final):
     st.subheader("Calificación")
@@ -1421,13 +1628,12 @@ def render_deuda_riesgo(df_final):
     mask_det = df_final['Instrumento'].astype(str).str.upper() != 'TOTAL'
     df_det = df_final.loc[mask_det].copy()
 
-    # Tabla semáforo
     pct_num = pd.to_numeric(df_det['% Cartera'].str.replace('%','', regex=False), errors='coerce').fillna(0.0)
     vals = pd.to_numeric(df_det.get('_VALOR_RATING_MIN', np.nan), errors='coerce')
 
     is_rep = df_det['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
              df_det['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
-    vals.loc[is_rep] = 1.0  # reporto → AAA
+    vals.loc[is_rep] = 1.0
 
     escala = vals.map(lambda v: VAL_TO_BUCKET.get(int(v), "NR") if not pd.isna(v) else "NR")
     tabla = (pd.DataFrame({'Escala': escala, 'Pct': pct_num})
@@ -1440,29 +1646,36 @@ def render_deuda_riesgo(df_final):
     def color_row(row):
         e = str(row["Escala"])
         if e in ("AAA","AA+","AA","AA-","A+","A","A-"):
-            c="#dcfce7"      # verde
+            c="#dcfce7"
         elif e in ("BBB+","BBB","BBB-"):
-            c="#fef9c3"      # amarillo
+            c="#fef9c3"
         elif e in ("NR",):
-            c="#e2e8f0"      # gris neutro
+            c="#e2e8f0"
         else:
-            c="#fee2e2"      # rojo / naranja
+            c="#fee2e2"
         return [f"background-color: {c}"]*len(row)
 
+    styled = tabla.style.apply(color_row, axis=1)
+    html = styled.to_html(index=False, border=0)
     st.markdown('<div class="tiny-table">', unsafe_allow_html=True)
-    st.table(tabla.style.apply(color_row, axis=1).hide(axis="index"))
+    st.markdown(html, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Gráfica histórico de duración (nueva)
+    # Histórico duración
     if hist_dur is not None and not hist_dur.empty:
         hd = hist_dur.copy()
+        text_vals = [f"{v:.0f}" for v in hd["DURACION_DIAS"]]  # sin decimales
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=hd["MES"], y=hd["DURACION_DIAS"], mode="lines+markers", name="Duración (días)",
-            hovertemplate="%{x|%Y-%m}: %{y:.1f} días<extra></extra>"
+            x=hd["MES"], y=hd["DURACION_DIAS"],
+            mode="lines+markers+text",
+            name="Duración (días)",
+            text=text_vals,
+            textposition="top center",
+            hovertemplate="%{x|%Y-%m}: %{y:.0f} días<extra></extra>"
         ))
         fig.update_layout(
-            title="Duración - histórico mensual",
+            title="Duración - últimos 12 meses",
             yaxis=dict(title="Días"),
             xaxis=dict(title="Mes", tickangle=TICKANGLE),
             legend=LEGEND_RIGHT,
@@ -1474,7 +1687,7 @@ def render_deuda_riesgo(df_final):
         st.caption("No hay histórico de duración disponible.")
 
 def render_deuda_historico_trimestral():
-    st.subheader("Comportamiento en el tiempo por:")
+    st.subheader("Comportamiento del tipo de papel e instrumento")
     c1, c2 = st.columns(2)
     with c1:
         if hist_deuda_papel.empty:
@@ -1482,16 +1695,20 @@ def render_deuda_historico_trimestral():
         else:
             p = hist_deuda_papel.copy()
             pvt = p.pivot_table(index="PERIODO", columns="TIPO_PAPEL", values="Pct", aggfunc="sum").fillna(0)
-            st.plotly_chart(area100_from_pivot(pvt, "Tipo de Papel"),
-                            use_container_width=True, config={"displayModeBar": False})
+            idx = list(pvt.index)
+            tickvals = idx[::2] if len(idx) > 2 else idx
+            fig = area100_from_pivot(pvt, "Tipo de Papel", tickvals=tickvals)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     with c2:
         if hist_deuda_instr.empty:
             st.info("Sin histórico por Tipo de Instrumento.")
         else:
             p2 = hist_deuda_instr.copy()
             pvt2 = p2.pivot_table(index="PERIODO", columns="TIPO_INSTRUMENTO", values="Pct", aggfunc="sum").fillna(0)
-            st.plotly_chart(area100_from_pivot(pvt2, "Tipo de Instrumento"),
-                            use_container_width=True, config={"displayModeBar": False})
+            idx2 = list(pvt2.index)
+            tickvals2 = idx2[::2] if len(idx2) > 2 else idx2
+            fig2 = area100_from_pivot(pvt2, "Tipo de Instrumento", tickvals=tickvals2)
+            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
 
 def render_deuda_tabla(df_final):
     st.subheader("Portafolio")
@@ -1501,7 +1718,6 @@ def render_deuda_tabla(df_final):
     mask_det = df_final['Instrumento'].astype(str).str.upper() != 'TOTAL'
     df_det = df_final.loc[mask_det].copy()
 
-    # Reemplazo en detalle también
     df_det['Tipo de instrumento'] = df_det['Tipo de instrumento'].replace(
         {None: 'Reporto Guber Excento', 'none': 'Reporto Guber Excento', 'None': 'Reporto Guber Excento'}
     )
@@ -1520,11 +1736,78 @@ def render_deuda_tabla(df_final):
         sub["__m__"] = money_to_float_series(sub["Monto"])
         sub = sub.sort_values("__m__", ascending=False).drop(columns="__m__")
 
-        cols_final = [c for c in cols_order if c in sub.columns] + [c for c in sub.columns if c not in cols_order]
-        with st.expander(f"Producto: {prod}  —  instrumentos: {len(sub)}", expanded=False):
+        # Tabla a mostrar: sin Producto, _VALOR_RATING_MIN, _ID_PRODUCTO
+        display_sub = sub.drop(columns=["_VALOR_RATING_MIN", "_ID_PRODUCTO", "Producto"], errors="ignore")
+
+        cols_final = [c for c in cols_order if c in display_sub.columns] + \
+                     [c for c in display_sub.columns if c not in cols_order]
+        with st.expander(f"Producto: {prod}  —  instrumentos: {len(display_sub)}", expanded=False):
             st.markdown('<div class="tiny-table">', unsafe_allow_html=True)
-            st.dataframe(sub[cols_final], hide_index=True, use_container_width=True)
+            altura = min(900, 60 + 22 * len(display_sub))
+            st.dataframe(display_sub[cols_final], hide_index=True, use_container_width=True, height=altura)
             st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br><em>Carry calculado a 365 días</em>", unsafe_allow_html=True)
+
+def render_deuda_por_producto_comp(df_final):
+    st.subheader("Composición por estrategia de deuda")
+    if df_final.empty:
+        st.info("Sin instrumentos de Deuda en el corte actual.")
+        return
+    mask_det = df_final['Instrumento'].astype(str).str.upper() != 'TOTAL'
+    df_det = df_final.loc[mask_det].copy()
+    df_det['Tipo de instrumento'] = df_det['Tipo de instrumento'].replace(
+        {None: 'Reporto Guber Excento', 'none': 'Reporto Guber Excento', 'None': 'Reporto Guber Excento'}
+    )
+
+    productos = sorted(df_det["Producto"].fillna("SIN_DESCRIPCION").astype(str).unique().tolist())
+    sel = st.multiselect("Selecciona estrategia(s) Deuda", options=productos, default=productos[:1])
+    if not sel:
+        st.info("Selecciona al menos un producto.")
+        return
+
+    for prod in sel:
+        sub = df_det[df_det["Producto"].fillna("SIN_DESCRIPCION").astype(str) == prod].copy()
+        if sub.empty:
+            continue
+        sub["MontoNum"] = money_to_float_series(sub["Monto"])
+        serie_tp = sub.groupby("Tipo de Papel")["MontoNum"].sum().sort_values(ascending=False)
+        serie_ti = sub.groupby("Tipo de instrumento")["MontoNum"].sum().sort_values(ascending=False)
+
+        st.markdown(f"**Estrategia: {prod}**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(
+                donut_figure(serie_tp.index.tolist(), serie_tp.values.tolist(),
+                             f"{prod} — Tipo de Papel", kind="money"),
+                use_container_width=True, config={"displayModeBar": False}
+            )
+        with c2:
+            st.plotly_chart(
+                donut_figure(serie_ti.index.tolist(), serie_ti.values.tolist(),
+                             f"{prod} — Tipo de Instrumento", kind="money"),
+                use_container_width=True, config={"displayModeBar": False}
+            )
+
+def render_deuda_rendimientos_por_producto():
+    st.subheader("Rendimientos por estrategia de deuda")
+    if df_hist_rend_prod is None or df_hist_rend_prod.empty:
+        st.info("Sin rendimientos por producto disponibles.")
+        return
+
+    # Clasificar productos como Deuda / RV usando AA
+    prod_act = df_aa_producto[["PRODUCTO","ACTIVO"]].drop_duplicates()
+    df = df_hist_rend_prod.merge(prod_act, left_on="PRODUCTO", right_on="PRODUCTO", how="left")
+    df = df[df["ACTIVO"] == "Deuda"]
+    if df.empty:
+        st.info("No hay productos de deuda con rendimientos.")
+        return
+
+    productos = sorted(df["PRODUCTO"].unique().tolist())
+    prod_sel = st.selectbox("Estrategia Deuda", options=productos, index=0)
+    modo = st.radio("Tipo de rendimiento", ["Anualizado","Efectivo"], horizontal=True, key="rend_deuda_prod")
+
+    plot_rend_producto_series(df, prod_sel, modo, "Rendimientos brutos")
 
 def render_rv_resumen():
     st.subheader("Distribución")
@@ -1560,38 +1843,51 @@ def render_rv_resumen():
         st.markdown('</div>', unsafe_allow_html=True)
 
 def render_rv_por_producto():
-    st.subheader("Patricipación de industria y sector por producto")
+    st.subheader("Participación de industria y sector por estrategia")
     if rv_enriq_base.empty:
         st.info("No hay RV en el corte actual.")
         return
 
-    productos = sorted(rv_enriq_base["ID_PRODUCTO"].dropna().unique().tolist())
-    sel = st.multiselect("Selecciona producto(s) RV", options=productos, default=productos[:1])
+    productos = sorted(rv_enriq_base["Producto"].fillna("SIN_DESCRIPCION").astype(str).unique().tolist())
+    sel = st.multiselect("Selecciona estrategia(s) RV", options=productos, default=productos[:1])
     if not sel:
         st.info("Selecciona al menos un producto.")
         return
 
-    for pid in sel:
-        sub = rv_enriq_base[rv_enriq_base["ID_PRODUCTO"] == pid]
+    for prod in sel:
+        sub = rv_enriq_base[rv_enriq_base["Producto"].fillna("SIN_DESCRIPCION").astype(str) == prod]
+        if sub.empty:
+            continue
         c1, c2 = st.columns(2)
         with c1:
             sub_s = sub.groupby("sector")["MONTO"].sum().reset_index().sort_values("MONTO", ascending=False)
-            st.plotly_chart(donut_figure(sub_s["sector"], sub_s["MONTO"], f"Producto {int(pid)} — Sector"),
-                            use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                donut_figure(sub_s["sector"], sub_s["MONTO"], f"Estrategia {prod} — Sector"),
+                use_container_width=True, config={"displayModeBar": False}
+            )
         with c2:
             sub_i = sub.groupby("industry")["MONTO"].sum().reset_index().sort_values("MONTO", ascending=False)
-            st.plotly_chart(donut_figure(sub_i["industry"], sub_i["MONTO"], f"Producto {int(pid)} — Industria"),
-                            use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                donut_figure(sub_i["industry"], sub_i["MONTO"], f"Estrategia {prod} — Industria"),
+                use_container_width=True, config={"displayModeBar": False}
+            )
 
         view = (sub.groupby(["NOMBRE_EMISORA","Nombre Completo","industry","sector"])["MONTO"].sum()
                   .reset_index().sort_values("MONTO", ascending=False))
         view["MONTO"] = view["MONTO"].map(lambda x: f"${x:,.2f}")
+        view = view.rename(columns={
+            "NOMBRE_EMISORA":"Emisora",
+            "Nombre Completo":"Nombre completo",
+            "industry":"Industria",
+            "sector":"Sector",
+            "MONTO":"Monto"
+        })
         st.markdown('<div class="tiny-table">', unsafe_allow_html=True)
-        st.dataframe(view.rename(columns={"NOMBRE_EMISORA":"Emisora"}), hide_index=True, use_container_width=True)
+        st.dataframe(view, hide_index=True, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
 def render_rv_evolucion():
-    st.subheader("Comportamiento en el tiempo de mejores sectores e industrias")
+    st.subheader("Comportamiento en el tiempo de principales sectores e industrias")
     rv12 = run_sql(f"""
         WITH H AS (
           SELECT
@@ -1633,16 +1929,14 @@ def render_rv_evolucion():
     rv_m["industry"] = rv_m["industry"].fillna("SIN INDUSTRIA")
     rv_m["PctPort"] = (rv_m["MONTO"] / rv_m["TOT_RV"] * 100.0).round(4)
 
-    # Mejores sectores (suma anual)
     sec_rank = rv_m.groupby("sector")["PctPort"].sum().sort_values(ascending=False).head(3).index.tolist()
     rv_sec = rv_m[rv_m["sector"].isin(sec_rank)].copy()
-    piv_sec = rv_sec.pivot_table(index="MES", columns="sector", values="PctPort", aggfunc="sum").fillna(0).sort_index()
+    piv_sec = rv_sec.pivot_table(index="MES", columns="sector", values="PctPort", aggfunc="sum").fillna(0)
     piv_sec = piv_sec[piv_sec.mean(axis=0).sort_values(ascending=False).index]
 
-    # Mejores industrias (suma anual)
     ind_rank = rv_m.groupby("industry")["PctPort"].sum().sort_values(ascending=False).head(3).index.tolist()
     rv_ind = rv_m[rv_m["industry"].isin(ind_rank)].copy()
-    piv_ind = rv_ind.pivot_table(index="MES", columns="industry", values="PctPort", aggfunc="sum").fillna(0).sort_index()
+    piv_ind = rv_ind.pivot_table(index="MES", columns="industry", values="PctPort", aggfunc="sum").fillna(0)
     piv_ind = piv_ind[piv_ind.mean(axis=0).sort_values(ascending=False).index]
 
     fig_sec = go.Figure()
@@ -1652,7 +1946,7 @@ def render_rv_evolucion():
             hovertemplate="%{x|%Y-%m}: %{y:.2f}%<extra></extra>"
         ))
     fig_sec.update_layout(
-        title="Mejores 3 Sectores",
+        title="3 Sectores",
         yaxis=dict(title="% de RV", ticksuffix="%"),
         xaxis=dict(title="Mes", tickangle=TICKANGLE),
         legend=LEGEND_RIGHT,
@@ -1667,7 +1961,7 @@ def render_rv_evolucion():
             hovertemplate="%{x|%Y-%m}: %{y:.2f}%<extra></extra>"
         ))
     fig_ind.update_layout(
-        title="Mejores 3 Industrias",
+        title="3 Industrias",
         yaxis=dict(title="% de RV", ticksuffix="%"),
         xaxis=dict(title="Mes", tickangle=TICKANGLE),
         legend=LEGEND_RIGHT,
@@ -1681,6 +1975,24 @@ def render_rv_evolucion():
     with c2:
         st.plotly_chart(fig_ind, use_container_width=True, config={"displayModeBar": False})
 
+def render_rv_rendimientos_por_producto():
+    st.subheader("Rendimientos por estrategia de renta variable")
+    if df_hist_rend_prod is None or df_hist_rend_prod.empty:
+        st.info("Sin rendimientos por producto disponibles.")
+        return
+
+    prod_act = df_aa_producto[["PRODUCTO","ACTIVO"]].drop_duplicates()
+    df = df_hist_rend_prod.merge(prod_act, left_on="PRODUCTO", right_on="PRODUCTO", how="left")
+    df = df[df["ACTIVO"] == "Renta Variable"]
+    if df.empty:
+        st.info("No hay productos de renta variable con rendimientos.")
+        return
+
+    productos = sorted(df["PRODUCTO"].unique().tolist())
+    prod_sel = st.selectbox("Estrategia RV", options=productos, index=0)
+    modo = st.radio("Tipo de rendimiento", ["Anualizado","Efectivo"], horizontal=True, key="rend_rv_prod")
+
+    plot_rend_producto_series(df, prod_sel, modo, "Rendimientos brutos")
 
 # =========================
 #  TABS
@@ -1704,7 +2016,6 @@ if not print_mode:
 
     with tabs[2]:
         st.container().markdown('<div class="tabs-normal"></div>', unsafe_allow_html=True)
-        # KPIs rápidos (Instrumentos no cuentan la fila TOTAL — ya se excluye con mask_det)
         if df_final_deuda.empty:
             resumen_vals = { "Instrumentos":"0", "Valor mercado":"$0.00", "Duración (días)":"", "DxV (pond.)":"", "Rto. esperado 1 año":"" }
         else:
@@ -1723,7 +2034,7 @@ if not print_mode:
             for k,v in resumen_vals.items()
         ) + '</div>', unsafe_allow_html=True)
 
-        sub = st.tabs(["Composición", "Riesgo", "Histórico", "Detalle"])
+        sub = st.tabs(["Composición", "Riesgo", "Histórico", "Detalle", "Composicion por producto", "Rendimientos"])
         with sub[0]:
             render_deuda_composicion(df_final_deuda)
         with sub[1]:
@@ -1732,41 +2043,47 @@ if not print_mode:
             render_deuda_historico_trimestral()
         with sub[3]:
             render_deuda_tabla(df_final_deuda)
+        with sub[4]:
+            render_deuda_por_producto_comp(df_final_deuda)
+        with sub[5]:
+            render_deuda_rendimientos_por_producto()
 
     with tabs[3]:
         st.container().markdown('<div class="tabs-normal"></div>', unsafe_allow_html=True)
-        sub = st.tabs(["Nivel Activo", "Nivel Producto", "Histórico"])
+        sub = st.tabs(["Nivel Activo", "Nivel Producto", "Histórico", "Rendimientos"])
         with sub[0]:
             render_rv_resumen()
         with sub[1]:
             render_rv_por_producto()
         with sub[2]:
             render_rv_evolucion()
+        with sub[3]:
+            render_rv_rendimientos_por_producto()
 
 else:
-    # Vista de impresión — 1 página por pestaña
+    # Vista de impresión — sin page-break forzado
     st.markdown('<div class="print-container">', unsafe_allow_html=True)
 
     st.header("Resumen")
     render_resumen()
-    st.markdown('<div class="page-break"></div>', unsafe_allow_html=True)
 
     st.header("Asset Allocation — General / Detalle / Histórico (Anual)")
     render_allocation_general()
     render_allocation_detalle()
     render_allocation_historico()
-    st.markdown('<div class="page-break"></div>', unsafe_allow_html=True)
 
-    st.header("Deuda — Composición / Riesgo / Hist. Trimestral / Tabla")
+    st.header("Deuda — Composición / Riesgo / Hist. Trimestral / Tabla / Por producto / Rendimientos")
     render_deuda_composicion(df_final_deuda)
     render_deuda_riesgo(df_final_deuda)
     render_deuda_historico_trimestral()
     render_deuda_tabla(df_final_deuda)
-    st.markdown('<div class="page-break"></div>', unsafe_allow_html=True)
+    render_deuda_por_producto_comp(df_final_deuda)
+    render_deuda_rendimientos_por_producto()
 
-    st.header("Renta Variable — Resumen / Donuts por producto / Evolución 12m")
+    st.header("Renta Variable — Resumen / Por producto / Evolución 12m / Rendimientos")
     render_rv_resumen()
     render_rv_por_producto()
     render_rv_evolucion()
+    render_rv_rendimientos_por_producto()
 
 st.markdown("<hr/><div style='text-align:center;opacity:.85'><small>Datos al cierre del mes seleccionado</small></div>", unsafe_allow_html=True)
