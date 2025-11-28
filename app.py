@@ -118,19 +118,17 @@ def css_global():
       color:var(--ink);
     }
 
-    
     .chip-date{
       display:inline-block;
       padding:.24rem .52rem;
       border-radius:999px;
       margin:2px 6px 8px 0;
-      background:rgba(30,58,138,.08);          /* azul marino clarito de fondo */
-      border:1px solid rgba(30,58,138,.55);    /* borde azul marino */
+      background:rgba(30,58,138,.08);
+      border:1px solid rgba(30,58,138,.55);
       font-size:.84rem;
-      color:#1e3a8a;                           /* texto azul marino */
+      color:#1e3a8a;
       font-weight:600;
     }
-
 
     /* =========================
        TABLAS EN PANTALLA
@@ -144,7 +142,7 @@ def css_global():
       align-items: center !important;
     }
 
-    /* Celdas y encabezados (todas las tablas st.dataframe más grandes) */
+    /* Celdas y encabezados (todas las tablas st.dataframe en pantalla) */
     [data-testid="stDataFrame"] div[role="gridcell"],
     [data-testid="stDataFrame"] div[role="columnheader"]{
       font-size: 12px !important;
@@ -166,7 +164,7 @@ def css_global():
       font-size: 11px !important;
     }
 
-    /* TABLA DETALLE DEUDA — compacta (como antes) */
+    /* TABLA DETALLE DEUDA — compacta (se mantiene igual) */
     .deuda-detail-table [data-testid="stDataFrame"] div[role="columnheader"],
     .deuda-detail-table [data-testid="stDataFrame"] div[role="gridcell"]{
       font-size: 8px !important;
@@ -190,7 +188,7 @@ def css_global():
       text-overflow: ellipsis !important;
     }
 
-    /* Clase para forzar salto de página después de una tabla grande */
+    /* Clase para forzar salto de página explícito */
     @media print {
       .page-break-after{
         page-break-after: always;
@@ -213,15 +211,17 @@ def css_global():
       [data-testid="stStatusWidget"]{
         display: none !important;
       }
+
       .tabs-normal { display: none !important; }
       .print-container { display: block !important; }
       .block-container { padding: 0 !important; }
 
-        h1, h2, h3{
+      h1, h2, h3{
         margin-top: 0.25in !important;
         page-break-after: avoid;
         page-break-before: avoid;
       }
+
       .element-container,
       .plotly,
       .stPlotlyChart,
@@ -229,12 +229,17 @@ def css_global():
         break-inside: avoid;
       }
 
-      /* TABLAS st.dataframe en impresión */
+      /* TABLAS st.dataframe en impresión: fuente 18 */
+      [data-testid="stDataFrame"]{
+        page-break-after: always !important;
+        break-after: always !important;
+      }
+
       [data-testid="stDataFrame"] div[role="columnheader"],
       [data-testid="stDataFrame"] div[role="gridcell"]{
-        font-size: 11px !important;
+        font-size: 18px !important;
         line-height: 1.2 !important;
-        padding: 3px 6px !important;
+        padding: 4px 8px !important;
         text-align: center !important;
         justify-content: center !important;
         align-items: center !important;
@@ -243,7 +248,24 @@ def css_global():
         text-overflow: ellipsis !important;
       }
 
-      /* DETALLE DEUDA — compacta también al imprimir */
+      /* Tablas HTML (tiny_table_print) en impresión: fuente 18 + salto de página */
+      .table-print{
+        page-break-after: always !important;
+        break-after: always !important;
+      }
+
+      .table-print table.dataframe th,
+      .table-print table.dataframe td{
+        font-size: 18px !important;
+        line-height: 1.2 !important;
+        padding: 4px 8px !important;
+        text-align: center !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+      }
+
+      /* DETALLE DEUDA — se mantiene compacto también al imprimir */
       .deuda-detail-table [data-testid="stDataFrame"] div[role="columnheader"],
       .deuda-detail-table [data-testid="stDataFrame"] div[role="gridcell"]{
         font-size: 8px !important;
@@ -251,10 +273,10 @@ def css_global():
         padding: 1px 3px !important;
       }
 
-      /* TABLA DEUDA RESUMEN compacta al imprimir */
+      /* TABLA DEUDA RESUMEN compacta al imprimir (solo tamaño, sin romper la lógica anterior) */
       .deuda-resumen-table th,
       .deuda-resumen-table td{
-        font-size: 8px !important;
+        font-size: 9px !important;
         padding: 2px 3px !important;
       }
 
@@ -284,14 +306,12 @@ def css_global():
         display: none !important;
       }
 
-
-      /* Primera sección: NO meter salto antes */
-      .print-section-first{
-        page-break-before: avoid !important;
-        break-before: avoid !important;
+      .page-break {
+        page-break-after: always !important;
+        break-after: always !important;
       }
 
-      /* Secciones siguientes: SÍ salto antes */
+      /* Cada sección de pestaña grande (AA, Deuda, RV) en página nueva */
       .print-section{
         page-break-before: always !important;
         break-before: always !important;
@@ -300,12 +320,14 @@ def css_global():
 
     </style>
     """
+
 st.markdown(css_global(), unsafe_allow_html=True)
 
 # Helper para tablas mini en impresión (con bordes + salto de página al final)
 def tiny_table_print(df: pd.DataFrame):
     html = df.to_html(index=False, border=0, classes="dataframe")
-    st.markdown(f'<div class="table-print pb-after">{html}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="table-print">{html}</div>', unsafe_allow_html=True)
+
 
 # =========================
 #  SIDEBAR (parámetros)
@@ -1208,11 +1230,23 @@ hist_dur = deuda_duracion_historico(ALIAS_CDM, INFLACION_ANUAL, F_DIA_FIN)
 # =========================
 st.markdown("<br>", unsafe_allow_html=True)
 NOMBRE_CLIENTE = get_nombre_cliente(ALIAS_CDM)
-st.title(f"REPORTE {NOMBRE_CLIENTE}")
-st.markdown(
-    f'<span class="chip-date">FECHA: {FECHA_ESTADISTICA}</span>',
-    unsafe_allow_html=True
-)
+
+if not print_mode:
+    # Vista normal
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.title(f"REPORTE {NOMBRE_CLIENTE}")
+    st.markdown(
+        f'<span class="chip" style="color:#0f172a;">FECHA: {FECHA_ESTADISTICA}</span>',
+        unsafe_allow_html=True
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+else:
+    # Vista de impresión: sin saltos extra
+    st.title(f"REPORTE {NOMBRE_CLIENTE}")
+    st.markdown(
+        f'<span class="chip" style="color:#0f172a;">FECHA: {FECHA_ESTADISTICA}</span>',
+        unsafe_allow_html=True
+    )
 st.markdown("<br>", unsafe_allow_html=True)
 
 # =========================
@@ -1395,8 +1429,6 @@ def render_resumen():
         unsafe_allow_html=True
     )
     st.markdown("<br>", unsafe_allow_html=True)
-    if print_mode:
-        st.markdown("<div class='page-break-after'></div>", unsafe_allow_html=True)
 
     # ======================
     # PRINCIPALES HOLDINGS
@@ -1643,9 +1675,6 @@ def render_allocation_detalle():
                 tiny_table_print(vista)
             else:
                 st.dataframe(vista, hide_index=True, use_container_width=True)
-    
-    if print_mode:
-        st.markdown("<div class='page-break-after'></div>", unsafe_allow_html=True)
 
 
 def render_allocation_historico():
@@ -1843,9 +1872,6 @@ def render_deuda_tabla(df_final):
             st.markdown('</div>', unsafe_allow_html=True)
             st.markdown("<br><em>Carry calculado a 365 días</em>", unsafe_allow_html=True)
 
-if print_mode:
-    st.markdown("<div class='page-break-after'></div>", unsafe_allow_html=True)
-
 
 def render_deuda_por_producto_comp(df_final):
     st.subheader("Composición por estrategia de deuda")
@@ -1936,9 +1962,6 @@ def render_rv_resumen():
             st.dataframe(ind_tab, hide_index=True, use_container_width=True)
     
     st.markdown("<br><em>Carry calculado a 365 días</em>", unsafe_allow_html=True)
-
-if print_mode:
-    st.markdown("<div class='page-break-after'></div>", unsafe_allow_html=True)
 
 
 def render_rv_por_producto():
@@ -2149,31 +2172,41 @@ if not print_mode:
             render_rv_rendimientos_por_producto()
 
 else:
-    # Vista de impresión — horizontal
     st.markdown('<div class="print-container">', unsafe_allow_html=True)
 
-    # Primera sección: SIN salto antes del título
-    st.markdown('<h2 class="print-section-first">Resumen</h2>', unsafe_allow_html=True)
+    # 🔹 RESUMEN: sin clase print-section, por eso NO tiene salto previo
+    st.header("Resumen")
     render_resumen()
 
-    # A partir de aquí, cada sección grande con salto de página antes
-    st.markdown('<h2 class="print-section">Asset Allocation</h2>', unsafe_allow_html=True)
+    # 🔹 ASSET ALLOCATION: sí tiene salto de página antes
+    st.markdown('<div class="print-section">', unsafe_allow_html=True)
+    st.header("Asset Allocation")
     render_allocation_general()
     render_allocation_detalle()
     render_allocation_historico()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<h2 class="print-section">Deuda</h2>', unsafe_allow_html=True)
+    # 🔹 DEUDA
+    st.markdown('<div class="print-section">', unsafe_allow_html=True)
+    st.header("Deuda")
     render_deuda_composicion(df_final_deuda)
     render_deuda_riesgo(df_final_deuda)
     render_deuda_historico_trimestral()
     render_deuda_tabla(df_final_deuda)
     render_deuda_por_producto_comp(df_final_deuda)
     render_deuda_rendimientos_por_producto()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<h2 class="print-section">Renta Variable</h2>', unsafe_allow_html=True)
+    # 🔹 RENTA VARIABLE
+    st.markdown('<div class="print-section">', unsafe_allow_html=True)
+    st.header("Renta Variable")
     render_rv_resumen()
     render_rv_por_producto()
     render_rv_evolucion()
     render_rv_rendimientos_por_producto()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 st.markdown("<hr/><div style='text-align:center;opacity:.85'><small>Datos al cierre del mes seleccionado</small></div>", unsafe_allow_html=True)
