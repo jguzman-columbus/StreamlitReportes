@@ -328,25 +328,154 @@ def tiny_table_print(df: pd.DataFrame):
     html = df.to_html(index=False, border=0, classes="dataframe")
     st.markdown(f'<div class="table-print">{html}</div>', unsafe_allow_html=True)
 
+# =========================
+#  HELPER: CONTRATOS POR ALIAS
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def get_contratos_por_alias(alias: str) -> list[int]:
+    """
+    Regresa la lista de ID_CLIENTE asociados al ALIAS_CDM dado.
+    Se usa solo para poblar el multiselect de 'Contrato' en la barra lateral.
+    """
+    alias = (alias or "").strip()
+    if not alias or not PWD:
+        return []
+    try:
+        dsn = oracledb.makedsn(HOST, PORT, sid=SID)
+        conn = oracledb.connect(user=USER, password=PWD, dsn=dsn)
+        df = pd.read_sql(
+            """
+            SELECT DISTINCT ID_CLIENTE
+            FROM SIAPII.V_M_CONTRATO_CDM
+            WHERE ALIAS_CDM = :alias
+            ORDER BY ID_CLIENTE
+            """,
+            conn,
+            params={"alias": alias},
+        )
+        conn.close()
+    except Exception:
+        return []
+    if df.empty:
+        return []
+    # Devolver como lista de int
+    return sorted(df["ID_CLIENTE"].dropna().astype(int).tolist())
 
 # =========================
 #  SIDEBAR (parámetros)
 # =========================
-with st.sidebar:
-    st.markdown('<div class="sb-card"><div class="sb-title">Parámetros</div>', unsafe_allow_html=True)
-    ALIAS_CDM = st.text_input("Cliente (ALIAS_CDM)", value=DEFAULT_ALIAS)
-    hoy = date.today()
-    coly, colm = st.columns(2)
-    with coly:
-        y = st.number_input("Año", 2000, 2100, hoy.year, step=1)
-    with colm:
-        m = st.number_input("Mes", 1, 12, hoy.month, step=1)
-    INFLACION_ANUAL = st.number_input("Inflación anual (dec)", 0.0, 1.0, DEFAULT_INFL, 0.001, format="%.3f")
-    st.markdown('</div>', unsafe_allow_html=True)
+# Estado inicial de parámetros aplicados (solo cambian al presionar "Actualizar")
+hoy = date.today()
+if "ALIAS_APPLIED" not in st.session_state:
+    st.session_state["ALIAS_APPLIED"] = DEFAULT_ALIAS
+if "Y_APPLIED" not in st.session_state:
+    st.session_state["Y_APPLIED"] = hoy.year
+if "M_APPLIED" not in st.session_state:
+    st.session_state["M_APPLIED"] = hoy.month
+if "INFL_APPLIED" not in st.session_state:
+    st.session_state["INFL_APPLIED"] = DEFAULT_INFL
+if "CONTRATOS_APPLIED" not in st.session_state:
+    st.session_state["CONTRATOS_APPLIED"] = []
 
-    st.markdown('<div class="sb-card"><div class="sb-title">Impresión</div>', unsafe_allow_html=True)
-    print_mode = st.checkbox("Vista de impresión (Carta horizontal)", value=False)
-    st.markdown('</div>', unsafe_allow_html=True)
+with st.sidebar:
+    # Tarjeta principal de parámetros
+    st.markdown(
+        """
+        <div class="sb-card">
+          <div class="sb-title">Parámetros del reporte</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("param_form"):
+        # Alias (cliente)
+        alias_input = st.text_input(
+            "Cliente (ALIAS_CDM)",
+            value=st.session_state.get("ALIAS_APPLIED", DEFAULT_ALIAS),
+            help="Alias del cliente tal como viene en V_M_CONTRATO_CDM (ALIAS_CDM).",
+        ).strip().upper()
+
+        # Contratos según alias escrito
+        contratos_disponibles = get_contratos_por_alias(alias_input)
+        contratos_applied = st.session_state.get("CONTRATOS_APPLIED", [])
+
+        # Si no hay contratos aplicados todavía, por default todos los disponibles
+        if not contratos_applied:
+            contratos_default = contratos_disponibles
+        else:
+            # Filtrar solo los que sigan existiendo para ese alias
+            contratos_default = [c for c in contratos_applied if c in contratos_disponibles] or contratos_disponibles
+
+        contrato_sel = st.multiselect(
+            "Contrato",
+            options=contratos_disponibles,
+            default=contratos_default,
+            help="Selecciona uno o varios ID_CLIENTE asociados al alias.",
+        )
+
+        coly, colm = st.columns(2)
+        with coly:
+            y_input = st.number_input(
+                "Año",
+                min_value=2000,
+                max_value=2100,
+                value=int(st.session_state.get("Y_APPLIED", hoy.year)),
+                step=1,
+            )
+        with colm:
+            m_input = st.number_input(
+                "Mes",
+                min_value=1,
+                max_value=12,
+                value=int(st.session_state.get("M_APPLIED", hoy.month)),
+                step=1,
+            )
+
+        infl_input = st.number_input(
+            "Inflación anual (dec)",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.get("INFL_APPLIED", DEFAULT_INFL)),
+            step=0.001,
+            format="%.3f",
+        )
+
+        # Botón para aplicar cambios (no se recalcula nada hasta presionar aquí)
+        aplicar = st.form_submit_button("Actualizar")
+
+        if aplicar:
+            st.session_state["ALIAS_APPLIED"] = alias_input or DEFAULT_ALIAS
+            st.session_state["Y_APPLIED"] = int(y_input)
+            st.session_state["M_APPLIED"] = int(m_input)
+            st.session_state["INFL_APPLIED"] = float(infl_input)
+            st.session_state["CONTRATOS_APPLIED"] = contrato_sel or contratos_disponibles
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Tarjeta para modo impresión
+    st.markdown(
+        """
+        <div class="sb-card">
+          <div class="sb-title">Impresión</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    print_mode = st.checkbox("Vista de impresión", value=False)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+#  PARÁMETROS ACTIVOS (USADOS EN EL REPORTE)
+# =========================
+hoy = date.today()  # por si se usa en otros lados
+
+ALIAS_CDM = st.session_state.get("ALIAS_APPLIED", DEFAULT_ALIAS)
+y = int(st.session_state.get("Y_APPLIED", hoy.year))
+m = int(st.session_state.get("M_APPLIED", hoy.month))
+INFLACION_ANUAL = float(st.session_state.get("INFL_APPLIED", DEFAULT_INFL))
+
+# Contratos seleccionados
+CONTRATOS_SELECCIONADOS = st.session_state.get("CONTRATOS_APPLIED", [])
+CONTRATOS_KEY = tuple(sorted(CONTRATOS_SELECCIONADOS))  # para cache
 
 # =========================
 #  FECHAS Y CONSTANTES VISUALES
@@ -420,6 +549,39 @@ CASE_ACTIVO = f"""
 """
 
 # =========================
+#  HELPER CONTRATO → SQL
+# =========================
+def build_contrato_filter_sql(contratos, col_qualified: str, param_prefix: str):
+    """
+    Construye fragmento 'AND col_qualified IN (:p0, :p1, ...)' + diccionario de parámetros
+    a partir de la lista de contratos seleccionados.
+    """
+    if not contratos:
+        return "", {}
+    # Valores únicos y como int
+    unique = []
+    seen = set()
+    for c in contratos:
+        try:
+            v = int(c)
+        except Exception:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        unique.append(v)
+    if not unique:
+        return "", {}
+    placeholders = []
+    params = {}
+    for i, cid in enumerate(unique):
+        key = f"{param_prefix}{i}"
+        placeholders.append(f":{key}")
+        params[key] = cid
+    clause = f" AND {col_qualified} IN ({', '.join(placeholders)}) "
+    return clause, params
+
+# =========================
 #  UTILIDADES EXTRA
 # =========================
 @st.cache_data(ttl=900, show_spinner=True)
@@ -453,15 +615,19 @@ def _to_dec(x):
 #  Rendimientos contrato 12m
 # =========================
 @st.cache_data(ttl=900, show_spinner=True)
-def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFrame:
+def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int, contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
     ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
     start = (ref - pd.DateOffset(months=11)).replace(day=1)
     end   = (ref + pd.offsets.MonthEnd(0))
-    sql = """
+
+    filtro_cts, extra_params = build_contrato_filter_sql(contratos_key, "ID_CLIENTE", "cid_rc")
+
+    sql = f"""
     WITH CTS AS (
       SELECT ID_CLIENTE
       FROM SIAPII.V_M_CONTRATO_CDM
       WHERE ALIAS_CDM = :alias
+      {filtro_cts}
     )
     SELECT
         r.ANIO,
@@ -477,11 +643,14 @@ def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
       AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
           BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
     """
-    df = run_sql(sql, {
+    params = {
         "alias": alias,
         "d_ini": start.strftime("%Y-%m-%d"),
         "d_fin": end.strftime("%Y-%m-%d"),
-    })
+    }
+    params.update(extra_params)
+
+    df = run_sql(sql, params)
     if df.empty:
         return pd.DataFrame(columns=[
             "ANIO","MES",
@@ -503,20 +672,24 @@ def rend_bruto_contrato_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
 #  Rendimientos por producto 12m (V_RENDIMIENTO_PROD)
 # =========================
 @st.cache_data(ttl=900, show_spinner=True)
-def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFrame:
+def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int, contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
     ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
     start = (ref - pd.DateOffset(months=11)).replace(day=1)
     end = (ref + pd.offsets.MonthEnd(0))
     tiene_nivel_prod = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'NIVEL_PRODUCTO')
     filtro_nivel = "AND r.NIVEL_PRODUCTO = 'SI'" if tiene_nivel_prod else ""
+
     has_idcdm_cto = _col_exists('SIAPII', 'V_M_CONTRATO_CDM', 'ID_CDM')
     has_idcdm_rp  = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'ID_CDM')
+
     if has_idcdm_cto and has_idcdm_rp:
+        filtro_cts, extra_params = build_contrato_filter_sql(contratos_key, "ID_CLIENTE", "cid_rp1")
         sql = f"""
         WITH CTS AS (
             SELECT DISTINCT ID_CDM
             FROM SIAPII.V_M_CONTRATO_CDM
             WHERE ALIAS_CDM = :alias
+            {filtro_cts}
         )
         SELECT
             r.ANIO,
@@ -537,7 +710,14 @@ def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
           AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
               BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
         """
+        params = {
+            "alias": alias,
+            "d_ini": start.strftime("%Y-%m-%d"),
+            "d_fin": end.strftime("%Y-%m-%d"),
+        }
+        params.update(extra_params)
     else:
+        filtro_pa, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_rp2")
         sql = f"""
         WITH PROD_ALIAS AS (
             SELECT DISTINCT e.ID_PRODUCTO
@@ -545,6 +725,7 @@ def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
             JOIN SIAPII.V_M_CONTRATO_CDM c
               ON c.ID_CLIENTE = e.ID_CLIENTE
             WHERE c.ALIAS_CDM = :alias
+              {filtro_pa}
         )
         SELECT
             r.ANIO,
@@ -565,11 +746,14 @@ def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int) -> pd.DataFram
           AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
               BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
         """
-    df = run_sql(sql, {
-        "alias": alias,
-        "d_ini": start.strftime("%Y-%m-%d"),
-        "d_fin": end.strftime("%Y-%m-%d"),
-    })
+        params = {
+            "alias": alias,
+            "d_ini": start.strftime("%Y-%m-%d"),
+            "d_fin": end.strftime("%Y-%m-%d"),
+        }
+        params.update(extra_params)
+
+    df = run_sql(sql, params)
     if df.empty:
         return pd.DataFrame(columns=[
             "ANIO","MES","ID_PRODUCTO","PRODUCTO",
@@ -600,15 +784,17 @@ def _annualize_from_effective(tef_dec, plazo_dias):
     return out
 
 @st.cache_data(ttl=900, show_spinner=True)
-def rend_bruto_contrato_y_producto(alias: str, anio: int, mes: int):
+def rend_bruto_contrato_y_producto(alias: str, anio: int, mes: int, contratos_key: tuple[int, ...] | None = None):
     ids = run_sql("""
         SELECT ID_CLIENTE FROM SIAPII.V_M_CONTRATO_CDM
         WHERE ALIAS_CDM = :alias
     """, {"alias": alias})
     if ids.empty:
         return np.nan, np.nan, pd.DataFrame(columns=["Producto","Mensual Anualizado","Acum Anualizado"])
+
     has_id_producto = _col_exists('SIAPII','V_RENDIMIENTO_CTO','ID_PRODUCTO')
     has_desc_producto = _col_exists('SIAPII','V_RENDIMIENTO_CTO','DESCRIPCION_PRODUCTO')
+
     sel_cols = """
         r.ANIO, r.MES, r.ID_CDM, r.ID_CLIENTE,
         r.MODALIDAD, r.NIVEL, r.PERIODO, r.MONEDA_ORIGEN, r.NIVEL_PRODUCTO,
@@ -620,9 +806,15 @@ def rend_bruto_contrato_y_producto(alias: str, anio: int, mes: int):
         sel_cols += ", r.ID_PRODUCTO"
     if has_desc_producto:
         sel_cols += ", r.DESCRIPCION_PRODUCTO"
+
+    filtro_cts, extra_params = build_contrato_filter_sql(contratos_key, "ID_CLIENTE", "cid_rcp")
+
     base_sql = f"""
         WITH CTS AS (
-          SELECT ID_CLIENTE FROM SIAPII.V_M_CONTRATO_CDM WHERE ALIAS_CDM = :alias
+          SELECT ID_CLIENTE
+          FROM SIAPII.V_M_CONTRATO_CDM
+          WHERE ALIAS_CDM = :alias
+          {filtro_cts}
         )
         SELECT {sel_cols}
         FROM SIAPII.V_RENDIMIENTO_CTO r
@@ -631,22 +823,31 @@ def rend_bruto_contrato_y_producto(alias: str, anio: int, mes: int):
           AND r.MES  = :mes
           AND UPPER(r.TIPO_RENDIMIENTO) LIKE 'GESTION BRUTA'
     """
-    df = run_sql(base_sql, {"alias": alias, "anio": int(anio), "mes": int(mes)})
+    params = {"alias": alias, "anio": int(anio), "mes": int(mes)}
+    params.update(extra_params)
+
+    df = run_sql(base_sql, params)
     if df.empty:
         return np.nan, np.nan, pd.DataFrame(columns=["Producto","Mensual Anualizado","Acum Anualizado"])
+
     df_cto = df[df["NIVEL"].astype(str).str.upper()=="CONTRATO"].copy()
     if not df_cto.empty:
         df_cto_m = df_cto.dropna(subset=["TASA_EFECTIVA","PLAZO"]).head(1)
-        cto_m_anual = _annualize_from_effective(_to_dec(df_cto_m["TASA_EFECTIVA"].iloc[0]),
-                                                df_cto_m["PLAZO"].iloc[0]).iloc[0]
+        cto_m_anual = _annualize_from_effective(
+            _to_dec(df_cto_m["TASA_EFECTIVA"].iloc[0]),
+            df_cto_m["PLAZO"].iloc[0]
+        ).iloc[0]
         if df_cto.dropna(subset=["TASA_EFECTIVA_ACUMULADO","PLAZO_ACUMULADO"]).empty:
             cto_ytd_anual = np.nan
         else:
             row = df_cto.dropna(subset=["TASA_EFECTIVA_ACUMULADO","PLAZO_ACUMULADO"]).head(1).iloc[0]
-            cto_ytd_anual = _annualize_from_effective(_to_dec(row["TASA_EFECTIVA_ACUMULADO"]),
-                                                      row["PLAZO_ACUMULADO"]).iloc[0]
+            cto_ytd_anual = _annualize_from_effective(
+                _to_dec(row["TASA_EFECTIVA_ACUMULADO"]),
+                row["PLAZO_ACUMULADO"]
+            ).iloc[0]
     else:
         cto_m_anual, cto_ytd_anual = np.nan, np.nan
+
     df_prod = pd.DataFrame(columns=["Producto","Mensual Anualizado","Acum Anualizado"])
     if has_id_producto or has_desc_producto:
         df_p = df[df["NIVEL_PRODUCTO"].astype(str).str.upper()=="SI"].copy()
@@ -657,8 +858,10 @@ def rend_bruto_contrato_y_producto(alias: str, anio: int, mes: int):
                 mp = run_sql("SELECT ID_PRODUCTO, COALESCE(DESCRIPCION,'SIN_DESCRIPCION') AS PRODUCTO FROM SIAPII.V_M_PRODUCTO")
                 df_p = df_p.merge(mp, on="ID_PRODUCTO", how="left")
                 df_p["Producto"] = df_p["PRODUCTO"].fillna(df_p.get("ID_PRODUCTO").astype(str))
+
             m_an = _annualize_from_effective(_to_dec(df_p["TASA_EFECTIVA"]), df_p["PLAZO"])
             a_an = _annualize_from_effective(_to_dec(df_p["TASA_EFECTIVA_ACUMULADO"]), df_p["PLAZO_ACUMULADO"])
+
             out = pd.DataFrame({
                 "Producto": df_p["Producto"].astype(str),
                 "Mensual Anualizado": (m_an*100.0).round(2),
@@ -683,8 +886,9 @@ def get_nombre_cliente(alias: str) -> str:
 # =========================
 #  BASE AA (corte)
 # =========================
-def build_query_base_unfiltered(alias: str, fecha: str) -> str:
-    return f"""
+def build_query_base_unfiltered(alias: str, fecha: str, contratos_key: tuple[int, ...] | None = None):
+    filtro_contratos, extra_params = build_contrato_filter_sql(contratos_key, "e.ID_CLIENTE", "cid_aa")
+    sql = f"""
     SELECT
       COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
       {CASE_ACTIVO} AS ACTIVO,
@@ -693,11 +897,17 @@ def build_query_base_unfiltered(alias: str, fecha: str) -> str:
     LEFT JOIN SIAPII.V_M_PRODUCTO p ON p.ID_PRODUCTO = e.ID_PRODUCTO
     WHERE e.ALIAS_CDM = :alias
       AND TRUNC(e.FECHA_ESTADISTICA) = TO_DATE(:fecha, 'YYYY-MM-DD')
+      {filtro_contratos}
     GROUP BY COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION'), {CASE_ACTIVO}
     """
+    params = {"alias": alias, "fecha": fecha}
+    params.update(extra_params)
+    return sql, params
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def aa_hist_ultimo_5_anios(alias: str):
+def aa_hist_ultimo_5_anios(alias: str, contratos_key: tuple[int, ...] | None = None):
+    filtro_contratos, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_aa_hist")
+
     SQL = f"""
     WITH A AS (
       SELECT
@@ -706,14 +916,19 @@ def aa_hist_ultimo_5_anios(alias: str):
         COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
         SUM(e.POSICION_TOTAL) AS MONTO
       FROM SIAPII.V_CLIENTE_ESTADISTICAS e
-      JOIN SIAPII.V_M_CONTRATO_CDM c ON c.ID_CLIENTE = e.ID_CLIENTE AND c.ALIAS_CDM = :alias
+      JOIN SIAPII.V_M_CONTRATO_CDM c
+        ON c.ID_CLIENTE = e.ID_CLIENTE
       LEFT JOIN SIAPII.V_M_PRODUCTO p ON p.ID_PRODUCTO = e.ID_PRODUCTO
-      WHERE e.FECHA_ESTADISTICA >= ADD_MONTHS(TRUNC(SYSDATE,'YYYY'), -12*5)
+      WHERE c.ALIAS_CDM = :alias
+        {filtro_contratos}
+        AND e.FECHA_ESTADISTICA >= ADD_MONTHS(TRUNC(SYSDATE,'YYYY'), -12*5)
       GROUP BY EXTRACT(YEAR FROM TRUNC(e.FECHA_ESTADISTICA)), {CASE_ACTIVO}, COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION')
     )
     SELECT * FROM A
     """
-    df = run_sql(SQL, {"alias": alias})
+    params = {"alias": alias}
+    params.update(extra_params)
+    df = run_sql(SQL, params)
     if df.empty:
         return (pd.DataFrame(columns=["ANIO","ACTIVO","MONTO","Pct"]),
                 pd.DataFrame(columns=["ANIO","PRODUCTO","MONTO","Pct"]))
@@ -757,21 +972,37 @@ def build_snapshot_params(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timest
         )
     return params, date_expr
 
-def where_filters_for_his(alias: str) -> str:
-    parts = ["c.ALIAS_CDM = :alias_up", "c.ID_CLIENTE = h.ID_CLIENTE"]
-    return "WHERE EXISTS ( SELECT 1 FROM SIAPII.V_M_CONTRATO_CDM c WHERE " + " AND ".join(parts) + " )"
+def where_filters_for_his(contratos_key: tuple[int, ...] | None = None):
+    base_sql = (
+        "WHERE EXISTS ( SELECT 1 FROM SIAPII.V_M_CONTRATO_CDM c "
+        "WHERE c.ALIAS_CDM = :alias_up AND c.ID_CLIENTE = h.ID_CLIENTE"
+    )
+    filtro, params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_his")
+    return base_sql + filtro + " )", params
 
 @st.cache_data(ttl=1200, show_spinner=True)
-def query_snapshot_deuda(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp) -> pd.DataFrame:
+def query_snapshot_deuda(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp,
+                         contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
     params, DATE_EXPR = build_snapshot_params(alias, f_ini, f_fin_next)
-    where_exists = where_filters_for_his(alias)
+    filtro_fc, params_fc = build_contrato_filter_sql(contratos_key, "c1.ID_CLIENTE", "cid_fc")
+    where_exists, params_h = where_filters_for_his(contratos_key)
+
+    params.update(params_fc)
+    params.update(params_h)
+
     SQL_SNAPSHOT = f"""
 WITH FECHA_C AS (
   SELECT MAX(TRUNC(h1.REGISTRO_CONTROL)) AS FECHA_CORTE
   FROM SIAPII.V_HIS_POSICION_CLIENTE h1
   WHERE TRUNC(h1.REGISTRO_CONTROL) >= TO_DATE(:f_ini_dt,'YYYY-MM-DD')
     AND TRUNC(h1.REGISTRO_CONTROL) <  TO_DATE(:f_fin_dt,'YYYY-MM-DD')
-    AND EXISTS (SELECT 1 FROM SIAPII.V_M_CONTRATO_CDM c1 WHERE c1.ALIAS_CDM = :alias_up AND c1.ID_CLIENTE = h1.ID_CLIENTE)
+    AND EXISTS (
+        SELECT 1
+        FROM SIAPII.V_M_CONTRATO_CDM c1
+        WHERE c1.ALIAS_CDM = :alias_up
+          AND c1.ID_CLIENTE = h1.ID_CLIENTE
+          {filtro_fc}
+    )
 ),
 H_CORTE AS (
   SELECT h.* FROM SIAPII.V_HIS_POSICION_CLIENTE h
@@ -936,52 +1167,130 @@ def map_productos() -> pd.DataFrame:
 def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFrame:
     if df_snap is None or df_snap.empty:
         return pd.DataFrame()
+
     df = df_snap.copy()
+
+    # =========================
+    # 1. Rating mínimo
+    # =========================
     rating_info = df.apply(min_rating_from_row, axis=1, result_type='expand')
     rating_info.columns = ['VALOR_RATING_MIN', 'RAW_RATING_MIN', 'SRC_RATING_MIN']
     df = pd.concat([df, rating_info], axis=1)
-    ytm_dec   = _auto_to_decimal(df['EMIS_TASA'].apply(_parse_rate_any))
-    tbase_dec = _auto_to_decimal(df.get('TASA_BASE', pd.Series([np.nan]*len(df))).apply(_parse_rate_any))
-    f_vto = pd.to_datetime(df['FECHA_VTO_EM'], errors='coerce')
-    f_corte = pd.to_datetime(df['FECHA_CORTE'], errors='coerce')
+
+    # =========================
+    # 2. Tasas crudas y normalizadas
+    # =========================
+    raw_ytm   = df['EMIS_TASA'].apply(_parse_rate_any)
+    raw_tbase = df.get('TASA_BASE', pd.Series([np.nan] * len(df))).apply(_parse_rate_any)
+
+    ytm_dec   = _auto_to_decimal(raw_ytm)
+    tbase_dec = _auto_to_decimal(raw_tbase)
+
+    has_tref = df.get('ID_TASA_REFERENCIA', pd.Series([np.nan] * len(df)))
+    mask_sin_ref = has_tref.isna()
+
+    mask_raro = mask_sin_ref & raw_ytm.notna() & (raw_ytm.abs() > 2) & (raw_ytm.abs() <= 40)
+    ytm_dec.loc[mask_raro] = (raw_ytm[mask_raro] / 100.0)
+
+    mask_extremo_ytm = ytm_dec.abs() > 2
+    ytm_dec.loc[mask_extremo_ytm] = np.nan
+
+    mask_extremo_base = tbase_dec.abs() > 2
+    tbase_dec.loc[mask_extremo_base] = np.nan
+
+    # =========================
+    # 3. Fechas y DxV
+    # =========================
+    f_vto   = pd.to_datetime(df['FECHA_VTO_EM'], errors='coerce')
+    f_corte = pd.to_datetime(df['FECHA_CORTE'],   errors='coerce')
     dxv_bruto = (f_vto - f_corte).dt.days
+
     is_reporto = df['TIPO_PAPEL'].astype(str).str.contains('reporto', case=False, na=False) | \
                  df['TIPO_INSTRUMENTO'].astype(str).str.contains('reporto', case=False, na=False)
     is_cero = df['TIPO_INSTRUMENTO'].astype(str).str.contains('cero', case=False, na=False)
-    dxv_mostrado = pd.Series(np.where(is_reporto, 1, dxv_bruto), index=df.index)
-    plazo = pd.to_numeric(df['PLAZO_CUPON'], errors='coerce')
-    dxv_sql = pd.to_numeric(df.get('DIAS_X_V', np.nan), errors='coerce')
+
+    dxv_mostrado = pd.Series(
+        np.where(is_reporto, 1, dxv_bruto),
+        index=df.index
+    )
+
+    plazo    = pd.to_numeric(df['PLAZO_CUPON'], errors='coerce')
+    dxv_sql  = pd.to_numeric(df.get('DIAS_X_V', np.nan), errors='coerce')
     dxv_real = dxv_sql.where(dxv_sql.notna(), dxv_bruto)
-    periodo_dias = pd.Series(np.where(is_reporto, 1,
-                                      np.where(is_cero & pd.notna(dxv_real) & (dxv_real > 0), dxv_real, plazo)),
-                             index=df.index).fillna(28).clip(lower=1)
+
+    periodo_dias = pd.Series(
+        np.where(
+            is_reporto,
+            1,
+            np.where(
+                is_cero & pd.notna(dxv_real) & (dxv_real > 0),
+                dxv_real,
+                plazo
+            )
+        ),
+        index=df.index
+    ).fillna(28).clip(lower=1)
+
     cap = 360.0 / periodo_dias
+
+    # =========================
+    # 4. Clasificación por tipo de instrumento
+    # =========================
     infl = float(inflacion_anual)
-    es_real = (df['TIPO_INSTRUMENTO'].astype(str).str.contains('tasa real', case=False, na=False)) & \
-              (pd.to_numeric(df['ID_DIVISA_TV'], errors='coerce') == 8)
+
+    es_real = (
+        df['TIPO_INSTRUMENTO'].astype(str).str.contains('tasa real', case=False, na=False)
+        & (pd.to_numeric(df['ID_DIVISA_TV'], errors='coerce') == 8)
+    )
     es_revisable = df['TIPO_INSTRUMENTO'].astype(str).str.contains('revis', case=False, na=False)
+
     mask_nominal = ~(es_real | es_revisable)
-    t_eq_nominal   = eq365(ytm_dec, cap)
+
+    # =========================
+    # 5. Tasa equivalente 365 por tipo
+    # =========================
+    t_eq_nominal = eq365(ytm_dec, cap)
+
     t_in_revisable = tbase_dec.fillna(0.0) + ytm_dec.fillna(0.0)
     t_eq_revisable = eq365(t_in_revisable, cap)
-    t_eq_real      = eq365(ytm_dec, cap)
-    K = 360.0/365.0
-    t_nom_real     = ((1.0 + (t_eq_real / K)) * (1.0 + (infl / K)) - 1.0) * K
+
+    t_eq_real = eq365(ytm_dec, cap)
+    K = 360.0 / 365.0
+    t_nom_real = ((1.0 + (t_eq_real / K)) * (1.0 + (infl / K)) - 1.0) * K
+
+    # =========================
+    # 6. Carry final por instrumento
+    # =========================
     t_carry = pd.Series(np.nan, index=df.index, dtype=float)
     t_carry[mask_nominal] = t_eq_nominal[mask_nominal]
     t_carry[es_revisable] = t_eq_revisable[es_revisable]
     t_carry[es_real]      = t_nom_real[es_real]
+
+    # =========================
+    # 7. Pesos, DxV y agregados de portafolio
+    # =========================
     val_real = pd.to_numeric(df['VALOR_REAL'], errors='coerce').fillna(0.0)
     peso = (val_real / val_real.sum()) if val_real.sum() > 0 else pd.Series(0.0, index=df.index)
+
     val_nom_raw = pd.to_numeric(df['VALOR_NOMINAL'], errors='coerce').fillna(0.0) * 100.0
     val_nom_raw = np.where(is_reporto, 0.0, val_nom_raw)
+
     carry_total_pp = float((t_carry * peso).sum() * 100.0)
     dxv_total_pond = float((dxv_mostrado.fillna(0.0) * peso).sum())
-    duracion_dias  = pd.to_numeric(df.get('DURACION_DIAS', np.nan), errors='coerce')
+
+    duracion_dias = pd.to_numeric(df.get('DURACION_DIAS', np.nan), errors='coerce')
     dur_portafolio = float((duracion_dias.fillna(0.0) * peso).sum()) if 'DURACION_DIAS' in df else None
+
+    # =========================
+    # 8. Tabla de detalle
+    # =========================
     nombre = df['NOMBRE_EMISORA'].astype(str).fillna("")
-    serie  = df.get('SERIE', pd.Series([""]*len(df))).astype(str).fillna("").replace("nan","")
-    instrumento = nombre.str.strip().str.cat(serie.apply(lambda s: (" " + s.strip()) if s and s.strip() else ""), na_rep="")
+    serie  = df.get('SERIE', pd.Series([""] * len(df))).astype(str).fillna("").replace("nan", "")
+    instrumento = nombre.str.strip().str.cat(
+        serie.apply(lambda s: (" " + s.strip()) if s and s.strip() else ""),
+        na_rep=""
+    )
+
     df_final = pd.DataFrame({
         'Tipo de Papel'       : df['TIPO_PAPEL'].astype(str),
         'Tipo de instrumento' : df['TIPO_INSTRUMENTO'].astype(str),
@@ -989,44 +1298,62 @@ def build_df_final(df_snap: pd.DataFrame, inflacion_anual: float) -> pd.DataFram
         'Fecha vto'           : f_vto.dt.date,
         'DxV'                 : dxv_mostrado,
         'Duración (días)'     : (pd.to_numeric(duracion_dias, errors='coerce').round(0).astype('Int64')
-                                  if 'DURACION_DIAS' in df else pd.Series([pd.NA]*len(df))),
+                                  if 'DURACION_DIAS' in df else pd.Series([pd.NA] * len(df))),
         'Tasa valuacion'      : [fmt_pct(x) for x in t_eq_nominal],
         'Carry (365 d)'       : [fmt_pct(x) for x in t_carry],
         'Valor Nominal'       : [f"{v:,.0f}" for v in val_nom_raw],
         'Monto'               : val_real.map(fmt_money2),
         '% Cartera'           : (peso * 100).map(lambda x: f"{x:.2f}%"),
-        'Tasa ref'            : df.get('TASA_REF_NAME', pd.Series(['']*len(df))).astype(str),
-        'Tasa base'           : df.get('TASA_BASE', pd.Series([np.nan]*len(df))),
+        'Tasa ref'            : df.get('TASA_REF_NAME', pd.Series([''] * len(df))).astype(str),
+        'Tasa base'           : df.get('TASA_BASE', pd.Series([np.nan] * len(df))),
         'Calificación'        : df['RAW_RATING_MIN'].fillna(df['CALIFICACION_HOMOLOGADA'].astype(str)),
         '_VALOR_RATING_MIN'   : df['VALOR_RATING_MIN'],
         '_ID_PRODUCTO'        : df['ID_PRODUCTO']
     })
+
     mp = map_productos()
     df_final = df_final.merge(mp, left_on="_ID_PRODUCTO", right_on="ID_PRODUCTO", how="left")
     df_final.drop(columns=["ID_PRODUCTO"], inplace=True, errors="ignore")
     df_final.rename(columns={"PRODUCTO": "Producto"}, inplace=True)
-    ord_tp = {'Reporto':1,'Gubernamental':2,'CuasiGuber':3,'Banca Comercial':4,'Privado':5}
+
+    ord_tp = {'Reporto': 1, 'Gubernamental': 2, 'CuasiGuber': 3, 'Banca Comercial': 4, 'Privado': 5}
     is_rep2 = df_final['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
               df_final['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
+
     df_final['__ord__'] = np.where(is_rep2, 1, df_final['Tipo de Papel'].map(ord_tp).fillna(98))
     df_final['__m__']   = money_to_float_series(df_final['Monto'])
+
     df_detail = (df_final
-                 .sort_values(['__ord__','__m__'], ascending=[True, False])
-                 .drop(columns=['__ord__','__m__'])
+                 .sort_values(['__ord__', '__m__'], ascending=[True, False])
+                 .drop(columns=['__ord__', '__m__'])
                  .reset_index(drop=True))
+
     mask_rep_det = df_detail['Tipo de Papel'].str.contains('reporto', case=False, na=False) | \
                    df_detail['Tipo de instrumento'].str.contains('reporto', case=False, na=False)
     df_detail.loc[mask_rep_det, 'Calificación'] = 'MXAAA'
+
     if len(df_detail):
         row_total = {
-            'Producto':'','Tipo de Papel':'','Tipo de instrumento':'','Instrumento':'TOTAL','Fecha vto':'',
-            'DxV':f"{dxv_total_pond:.0f}", 'Duración (días)':(f"{dur_portafolio:.0f}" if dur_portafolio is not None else ''),
-            'Tasa valuacion':'', 'Carry (365 d)':f"{carry_total_pp:.2f}%",
-            'Valor Nominal':'', 'Monto':f"${float(money_to_float_series(df_detail['Monto']).sum()):,.2f}",
-            '% Cartera':"100.00%", 'Tasa ref':'', 'Tasa base':'', 'Calificación':'',
-            '_VALOR_RATING_MIN':np.nan, '_ID_PRODUCTO':np.nan
+            'Producto': '',
+            'Tipo de Papel': '',
+            'Tipo de instrumento': '',
+            'Instrumento': 'TOTAL',
+            'Fecha vto': '',
+            'DxV': f"{dxv_total_pond:.0f}",
+            'Duración (días)': (f"{dur_portafolio:.0f}" if dur_portafolio is not None else ''),
+            'Tasa valuacion': '',
+            'Carry (365 d)': f"{carry_total_pp:.2f}%",
+            'Valor Nominal': '',
+            'Monto': f"${float(money_to_float_series(df_detail['Monto']).sum()):,.2f}",
+            '% Cartera': "100.00%",
+            'Tasa ref': '',
+            'Tasa base': '',
+            'Calificación': '',
+            '_VALOR_RATING_MIN': np.nan,
+            '_ID_PRODUCTO': np.nan
         }
         df_detail = pd.concat([df_detail, pd.DataFrame([row_total])], ignore_index=True)
+
     return df_detail
 
 # =========================
@@ -1046,9 +1373,11 @@ def core_issuer_map() -> pd.DataFrame:
     core["ticker_symbol"] = core.get("ticker_symbol", pd.Series(index=core.index, dtype=object))
     core["sector"] = core.get("sector", pd.Series(index=core.index, dtype=object))
     core["industry"] = core.get("industry", pd.Series(index=core.index, dtype=object))
+
     def _mode_or_default(s, default_val):
         s = s.dropna()
         return s.value_counts().index[0] if len(s) else default_val
+
     agg = (core.groupby("issuer_name", dropna=False)
            .agg({
                "ticker_symbol": lambda s: _mode_or_default(s, None),
@@ -1056,6 +1385,7 @@ def core_issuer_map() -> pd.DataFrame:
                "industry":      lambda s: _mode_or_default(s, "SIN INDUSTRIA"),
            })
            .reset_index())
+
     agg["Nombre Completo"] = np.where(
         agg["ticker_symbol"].notna() & (agg["ticker_symbol"].astype(str).str.strip() != ""),
         agg["ticker_symbol"].astype(str),
@@ -1067,15 +1397,24 @@ def core_issuer_map() -> pd.DataFrame:
     return agg[["issuer_name","Nombre Completo","sector","industry"]]
 
 @st.cache_data(ttl=900, show_spinner=True)
-def rv_snapshot_por_producto(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp) -> pd.DataFrame:
+def rv_snapshot_por_producto(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp,
+                             contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
+    filtro_fc, params_fc = build_contrato_filter_sql(contratos_key, "c1.ID_CLIENTE", "cid_rv_fc")
+    filtro_main, params_main = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_rv_main")
+
     SQL = f"""
     WITH FECHA_C AS (
       SELECT MAX(TRUNC(h.REGISTRO_CONTROL)) AS FECHA_CORTE
       FROM SIAPII.V_HIS_POSICION_CLIENTE h
       WHERE TRUNC(h.REGISTRO_CONTROL) >= TO_DATE(:f_ini_dt,'YYYY-MM-DD')
         AND TRUNC(h.REGISTRO_CONTROL) <  TO_DATE(:f_fin_dt,'YYYY-MM-DD')
-        AND EXISTS (SELECT 1 FROM SIAPII.V_M_CONTRATO_CDM c
-                    WHERE c.ALIAS_CDM = :alias AND c.ID_CLIENTE = h.ID_CLIENTE)
+        AND EXISTS (
+            SELECT 1
+            FROM SIAPII.V_M_CONTRATO_CDM c1
+            WHERE c1.ALIAS_CDM = :alias
+              AND c1.ID_CLIENTE = h.ID_CLIENTE
+              {filtro_fc}
+        )
     )
     SELECT
       h.ID_PRODUCTO,
@@ -1086,20 +1425,27 @@ def rv_snapshot_por_producto(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Tim
     JOIN SIAPII.V_M_CONTRATO_CDM c ON c.ID_CLIENTE = h.ID_CLIENTE AND c.ALIAS_CDM = :alias
     JOIN SIAPII.V_M_EMISORA e ON e.ID_EMISORA = h.ID_EMISORA
     WHERE (e.ID_TIPO_ACTIVO = 2 OR h.ID_PRODUCTO IN ({REPORTO_RV_CSV}))
+      {filtro_main}
     GROUP BY h.ID_PRODUCTO, e.ID_EMISORA
     HAVING SUM(h.VALOR_REAL) IS NOT NULL
     """
-    return run_sql(SQL, {
+    params = {
         "alias": alias,
         "f_ini_dt": f_ini.strftime("%Y-%m-%d"),
         "f_fin_dt": f_fin_next.strftime("%Y-%m-%d"),
-    })
+    }
+    params.update(params_fc)
+    params.update(params_main)
+    return run_sql(SQL, params)
 
 # =========================
 #  HISTÓRICO trimestral + duración
 # =========================
 @st.cache_data(ttl=3600, show_spinner=True)
-def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
+def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int,
+                                      contratos_key: tuple[int, ...] | None = None):
+    filtro_contratos, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_hist_tri")
+
     SQL = f"""
     WITH H AS (
       SELECT
@@ -1115,6 +1461,7 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
       JOIN SIAPII.V_M_EMISORA e ON e.ID_EMISORA = h.ID_EMISORA
       JOIN SIAPII.V_M_CONTRATO_CDM c ON c.ID_CLIENTE = h.ID_CLIENTE
       WHERE c.ALIAS_CDM = :alias
+        {filtro_contratos}
         AND h.REGISTRO_CONTROL >= TO_DATE('2020-01-01','YYYY-MM-DD')
       GROUP BY TRUNC(h.REGISTRO_CONTROL, 'Q'),
                CASE 
@@ -1138,10 +1485,11 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
     FROM FILT f
     JOIN TOT  t ON t.Q = f.Q
     """
-    df = run_sql(SQL, {"alias": alias, "id_act": id_tipo_activo})
+    params = {"alias": alias, "id_act": id_tipo_activo}
+    params.update(extra_params)
+    df = run_sql(SQL, params)
     if df.empty:
         return (pd.DataFrame(columns=["PERIODO","TIPO_PAPEL","Pct"]),
-
                 pd.DataFrame(columns=["PERIODO","TIPO_INSTRUMENTO","Pct"]))
     df = df.rename(columns={"PCT": "Pct"})
     df["Pct"] = pd.to_numeric(df["Pct"], errors="coerce").fillna(0.0)
@@ -1155,7 +1503,8 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int):
     return por_papel, por_instr
 
 @st.cache_data(ttl=1800, show_spinner=True)
-def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.Timestamp) -> pd.DataFrame:
+def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.Timestamp,
+                             contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
     filas = []
     ref_period = f_ref_fin.to_period("M")
     for k in range(11, -1, -1):
@@ -1163,7 +1512,7 @@ def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.T
         mes_end = periodo.to_timestamp("M")
         mes_ini = mes_end.replace(day=1)
         mes_end_next = mes_end + pd.Timedelta(days=1)
-        df_snap = query_snapshot_deuda(alias, mes_ini, mes_end_next)
+        df_snap = query_snapshot_deuda(alias, mes_ini, mes_end_next, contratos_key)
         df_det = build_df_final(df_snap, inflacion_anual)
         if df_det is None or df_det.empty:
             continue
@@ -1182,8 +1531,8 @@ def deuda_duracion_historico(alias: str, inflacion_anual: float, f_ref_fin: pd.T
 #  CONSULTAS BASE / PARAMS
 # =========================
 with st.spinner("Consultando Oracle / Postgres y construyendo vistas…"):
-    QUERY_BASE_AA = build_query_base_unfiltered(ALIAS_CDM, FECHA_ESTADISTICA)
-    base = run_sql(QUERY_BASE_AA, params={"alias": ALIAS_CDM, "fecha": FECHA_ESTADISTICA})
+    QUERY_BASE_AA, params_aa = build_query_base_unfiltered(ALIAS_CDM, FECHA_ESTADISTICA, CONTRATOS_KEY)
+    base = run_sql(QUERY_BASE_AA, params=params_aa)
     if not base.empty:
         base["MONTO"] = pd.to_numeric(base["MONTO"], errors="coerce").fillna(0.0)
         by_activo = base.groupby("ACTIVO", dropna=False)["MONTO"].sum().sort_values(ascending=False)
@@ -1201,14 +1550,15 @@ with st.spinner("Consultando Oracle / Postgres y construyendo vistas…"):
         df_aa_activo = pd.DataFrame(columns=["Categoria","Monto","Porcentaje"])
         df_aa_producto = pd.DataFrame(columns=["PRODUCTO","ACTIVO","Monto","Porcentaje"])
 
-cto_m_anual, cto_ytd_anual, df_rend_prod = rend_bruto_contrato_y_producto(ALIAS_CDM, y, m)
-df_hist_rend      = rend_bruto_contrato_hist_12m(ALIAS_CDM, y, m)
-df_hist_rend_prod = rend_bruto_producto_hist_12m(ALIAS_CDM, y, m)
+cto_m_anual, cto_ytd_anual, df_rend_prod = rend_bruto_contrato_y_producto(ALIAS_CDM, y, m, CONTRATOS_KEY)
+df_hist_rend      = rend_bruto_contrato_hist_12m(ALIAS_CDM, y, m, CONTRATOS_KEY)
+df_hist_rend_prod = rend_bruto_producto_hist_12m(ALIAS_CDM, y, m, CONTRATOS_KEY)
+
 with st.spinner("Calculando Deuda…"):
-    df_snap_deuda = query_snapshot_deuda(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT)
+    df_snap_deuda = query_snapshot_deuda(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT, CONTRATOS_KEY)
     df_final_deuda = build_df_final(df_snap_deuda, INFLACION_ANUAL)
 
-rv_df_raw = rv_snapshot_por_producto(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT)
+rv_df_raw = rv_snapshot_por_producto(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT, CONTRATOS_KEY)
 core_map_df = core_issuer_map()
 rv_enriq_base = pd.DataFrame()
 if not rv_df_raw.empty:
@@ -1221,9 +1571,9 @@ if not rv_df_raw.empty:
     rv_enriq_base["Nombre Completo"] = rv_enriq_base.get("Nombre Completo", rv_enriq_base["NOMBRE_EMISORA"].astype(str))
     rv_enriq_base["Nombre Completo"] = rv_enriq_base["Nombre Completo"].astype(str).str.split(",", n=1, expand=True)[0].str.strip()
 
-hist_deuda_papel, hist_deuda_instr = hist_trimestral_papel_instrumento(ALIAS_CDM, 1)
-hist_rv_papel,    hist_rv_instr    = hist_trimestral_papel_instrumento(ALIAS_CDM, 2)
-hist_dur = deuda_duracion_historico(ALIAS_CDM, INFLACION_ANUAL, F_DIA_FIN)
+hist_deuda_papel, hist_deuda_instr = hist_trimestral_papel_instrumento(ALIAS_CDM, 1, CONTRATOS_KEY)
+hist_rv_papel,    hist_rv_instr    = hist_trimestral_papel_instrumento(ALIAS_CDM, 2, CONTRATOS_KEY)
+hist_dur = deuda_duracion_historico(ALIAS_CDM, INFLACION_ANUAL, F_DIA_FIN, CONTRATOS_KEY)
 
 # =========================
 #  TÍTULO
@@ -1232,7 +1582,6 @@ st.markdown("<br>", unsafe_allow_html=True)
 NOMBRE_CLIENTE = get_nombre_cliente(ALIAS_CDM)
 
 if not print_mode:
-    # Vista normal
     st.markdown("<br>", unsafe_allow_html=True)
     st.title(f"REPORTE {NOMBRE_CLIENTE}")
     st.markdown(
@@ -1241,7 +1590,6 @@ if not print_mode:
     )
     st.markdown("<br>", unsafe_allow_html=True)
 else:
-    # Vista de impresión: sin saltos extra
     st.title(f"REPORTE {NOMBRE_CLIENTE}")
     st.markdown(
         f'<span class="chip" style="color:#0f172a;">FECHA: {FECHA_ESTADISTICA}</span>',
@@ -1393,7 +1741,6 @@ def render_resumen():
     top_prod_pct = float(top_prod_row["Porcentaje"].iloc[0]) if not top_prod_row.empty else 0.0
     top_prod_mnt = float(top_prod_row["Monto"].iloc[0]) if not top_prod_row.empty else 0.0
 
-    # Rendimiento contrato (KPIs usan anualizados)
     kpi_rend_mes = "—"
     kpi_rend_ytd = "—"
     if df_hist_rend is not None and not df_hist_rend.empty:
@@ -1430,12 +1777,9 @@ def render_resumen():
     )
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ======================
     # PRINCIPALES HOLDINGS
-    # ======================
     c1, c2 = st.columns((1, 1))
 
-    # RV por industria (montos)
     rv_series = pd.Series(dtype=float)
     if not rv_enriq_base.empty:
         rv_series = (
@@ -1443,7 +1787,6 @@ def render_resumen():
             .rename_axis("Categoria").astype(float)
         )
 
-    # Deuda por tipo de instrumento (monto absoluto)
     deuda_series = pd.Series(dtype=float)
     if not df_final_deuda.empty:
         mask_det = df_final_deuda["Instrumento"].astype(str).str.upper() != "TOTAL"
@@ -1516,9 +1859,7 @@ def render_resumen():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ======================
-    # Gráficas de rendimientos 12m (SEPARADAS: Mensual y Acumulado)
-    # ======================
+    # Rendimientos 12m
     st.markdown("### Rendimiento bruto del contrato")
 
     modo = st.radio(
@@ -1550,7 +1891,6 @@ def render_resumen():
         a_vals = (dfh[col_a] * 100.0).round(2)
         x_labels = dfh["LABEL"].tolist()
 
-        # Gráfica 1: Mensual
         fig_m = go.Figure()
         fig_m.add_trace(go.Scatter(
             x=x_labels,
@@ -1579,7 +1919,6 @@ def render_resumen():
         )
         st.plotly_chart(fig_m, use_container_width=True, config={"displayModeBar": False})
 
-        # Gráfica 2: Acumulado
         fig_a = go.Figure()
         fig_a.add_trace(go.Scatter(
             x=x_labels,
@@ -1676,10 +2015,9 @@ def render_allocation_detalle():
             else:
                 st.dataframe(vista, hide_index=True, use_container_width=True)
 
-
 def render_allocation_historico():
     st.subheader("Comportamiento de activos y estrategias")
-    aa_activo, aa_producto = aa_hist_ultimo_5_anios(ALIAS_CDM)
+    aa_activo, aa_producto = aa_hist_ultimo_5_anios(ALIAS_CDM, CONTRATOS_KEY)
     c1, c2 = st.columns((1,1))
     with c1:
         if aa_activo.empty:
@@ -1872,7 +2210,6 @@ def render_deuda_tabla(df_final):
             st.markdown('</div>', unsafe_allow_html=True)
             st.markdown("<br><em>Carry calculado a 365 días</em>", unsafe_allow_html=True)
 
-
 def render_deuda_por_producto_comp(df_final):
     st.subheader("Composición por estrategia de deuda")
     if df_final.empty:
@@ -1963,7 +2300,6 @@ def render_rv_resumen():
     
     st.markdown("<br><em>Carry calculado a 365 días</em>", unsafe_allow_html=True)
 
-
 def render_rv_por_producto():
     st.subheader("Participación de industria y sector por estrategia")
     if rv_enriq_base.empty:
@@ -2008,6 +2344,8 @@ def render_rv_por_producto():
 
 def render_rv_evolucion():
     st.subheader("Comportamiento en el tiempo de principales sectores e industrias")
+    filtro_contratos, extra_params = build_contrato_filter_sql(CONTRATOS_KEY, "c.ID_CLIENTE", "cid_rv_evo")
+
     rv12 = run_sql(f"""
         WITH H AS (
           SELECT
@@ -2019,9 +2357,12 @@ def render_rv_evolucion():
             END AS ID_ACTIVO_LOGICO,
             SUM(h.VALOR_REAL) AS MONTO
           FROM SIAPII.V_HIS_POSICION_CLIENTE h
-          JOIN SIAPII.V_M_CONTRATO_CDM c ON c.ID_CLIENTE = h.ID_CLIENTE AND c.ALIAS_CDM = :alias
+          JOIN SIAPII.V_M_CONTRATO_CDM c
+            ON c.ID_CLIENTE = h.ID_CLIENTE
           JOIN SIAPII.V_M_EMISORA e ON e.ID_EMISORA = h.ID_EMISORA
-          WHERE h.REGISTRO_CONTROL >= ADD_MONTHS(TRUNC(SYSDATE,'MM'), -12)
+          WHERE c.ALIAS_CDM = :alias
+            {filtro_contratos}
+            AND h.REGISTRO_CONTROL >= ADD_MONTHS(TRUNC(SYSDATE,'MM'), -12)
           GROUP BY TRUNC(h.REGISTRO_CONTROL,'MM'),
                    e.NOMBRE_EMISORA,
                    CASE 
@@ -2038,7 +2379,7 @@ def render_rv_evolucion():
         SELECT H.MES, H.NOMBRE_EMISORA, H.ID_ACTIVO_LOGICO, H.MONTO, R.TOT_RV
         FROM H JOIN RV_MES R ON R.MES = H.MES
         WHERE H.ID_ACTIVO_LOGICO = 2
-    """, {"alias": ALIAS_CDM})
+    """, {"alias": ALIAS_CDM, **extra_params})
     if rv12.empty:
         st.info("Sin datos para evolución 12 meses de RV.")
         return
@@ -2174,11 +2515,9 @@ if not print_mode:
 else:
     st.markdown('<div class="print-container">', unsafe_allow_html=True)
 
-    # 🔹 RESUMEN: sin clase print-section, por eso NO tiene salto previo
     st.header("Resumen")
     render_resumen()
 
-    # 🔹 ASSET ALLOCATION: sí tiene salto de página antes
     st.markdown('<div class="print-section">', unsafe_allow_html=True)
     st.header("Asset Allocation")
     render_allocation_general()
@@ -2186,7 +2525,6 @@ else:
     render_allocation_historico()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 🔹 DEUDA
     st.markdown('<div class="print-section">', unsafe_allow_html=True)
     st.header("Deuda")
     render_deuda_composicion(df_final_deuda)
@@ -2197,7 +2535,6 @@ else:
     render_deuda_rendimientos_por_producto()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 🔹 RENTA VARIABLE
     st.markdown('<div class="print-section">', unsafe_allow_html=True)
     st.header("Renta Variable")
     render_rv_resumen()
@@ -2207,6 +2544,5 @@ else:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
-
 
 st.markdown("<hr/><div style='text-align:center;opacity:.85'><small>Datos al cierre del mes seleccionado</small></div>", unsafe_allow_html=True)
