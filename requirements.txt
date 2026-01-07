@@ -6,3 +6,5 @@ plotly
 reportlab 
 kaleido
 psycopg2-binary
+openpyxl
+pyxlsb
