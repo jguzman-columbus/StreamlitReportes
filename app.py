@@ -3,9 +3,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import html
+import streamlit.components.v1 as components
 import oracledb
 from datetime import date
-
+from pathlib import Path
 # =========================
 #  CONFIG: ORACLE / POSTGRES
 # =========================
@@ -28,10 +30,77 @@ DEFAULT_INFL    = float(st.secrets.get("INFLACION_ANUAL", os.getenv("INFLACION_A
 REPORTO_RV_PRODUCTS = [144, 149]
 REPORTO_RV_CSV = ",".join(str(i) for i in REPORTO_RV_PRODUCTS)
 
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+
+BENCH_FILES = {
+    "PIP":    DATA_DIR / "Indices Pip.xlsx",
+    "RV":     DATA_DIR / "Indices RV.xlsx",
+    "BOLSAS": DATA_DIR / "Indices Bolsas.xlsx",
+    "SP":     DATA_DIR / "Indices SP.xlsx",
+}
+BENCH_MAP_FILE = DATA_DIR / "Mapa_Benchmarks.xlsx"
+BENCH_SHEET_DEFAULT = "indices"  # índices
+
+def add_datapoints_to_fig(fig, decimals=1):
+    """
+    Agrega datapoints arriba de cada punto o barra sin romper Bar / Scatter.
+    """
+    if fig is None:
+        return fig
+
+    for tr in fig.data:
+        # =========================
+        # BARRAS
+        # =========================
+        if isinstance(tr, go.Bar):
+            if tr.y is not None:
+                tr.text = [f"{v:.{decimals}f}%" if v is not None else "" for v in tr.y]
+                tr.textposition = "outside"
+
+        # =========================
+        # LÍNEAS / SCATTER
+        # =========================
+        elif isinstance(tr, go.Scatter):
+            if tr.y is not None:
+                tr.text = [f"{v:.{decimals}f}%" if v is not None else "" for v in tr.y]
+                tr.textposition = "top center"
+
+    return fig
+
+def html_escape(s: str) -> str:
+    return html.escape(str(s), quote=True)
+
+# =========================
+#  PLACEHOLDERS (para linters / Pylance)
+# =========================
+NOMBRE_CORTO_FOCUS: str = ""  # se sobreescribe en sidebar cuando seleccionas contrato
+
+# Backward-compat: versiones previas llamaban a get_bench_map_rows()
+def get_bench_map_rows(bm: pd.DataFrame, alias_cdm: str, nombre_corto_focus: str | None,
+                       producto: str | None = None, modo: str | None = None) -> pd.DataFrame:
+    """Filtra filas del Mapa_Benchmarks para (alias, contrato) y opcionalmente producto.
+    `modo` aquí es el MODO del mapa (p.ej. BLEND / MULTI), NO es 'ANUALIZADO/EFECTIVO'.
+    """
+    rows = get_bench_rows(bm, alias_cdm, nombre_corto_focus, producto)
+    if rows is None or len(rows) == 0:
+        return pd.DataFrame()
+    if modo:
+        m = str(modo).strip().upper()
+        if "MODO" in rows.columns:
+            rows = rows[rows["MODO"].astype(str).str.upper().eq(m)].copy()
+    return rows
+
 # =========================
 #  PAGE + CSS
 # =========================
 st.set_page_config(page_title="Reportes Institucionales", layout="wide")
+
+# Dispara impresión desde el área principal (el botón vive en sidebar)
+if st.session_state.get('DO_PRINT'):
+    components.html("<script>window.parent.print();</script>", height=0)
+    st.session_state['DO_PRINT'] = False
+
 
 def css_global():
     return """
@@ -316,8 +385,41 @@ def css_global():
         page-break-before: always !important;
         break-before: always !important;
       }
-    }
+          /* === BLOQUE IMPRESIÓN: título + gráfica NO se separan === */
+      .print-block{
+        break-inside: avoid !important;
+        page-break-inside: avoid !important;
+        margin: 0 0 10px 0 !important;
+      }
+      .print-title{
+        font-family:'DM Serif Display', serif !important;
+        font-size: 18pt !important;
+        font-weight: 600 !important;
+        margin: 0 0 8px 0 !important;
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+      }
 
+      /* Plotly: tamaño real legible */
+      .stPlotlyChart, .js-plotly-plot, .plotly{
+        width: 100% !important;
+        height: auto !important;
+        break-inside: avoid !important;
+        page-break-inside: avoid !important;
+      }
+
+      /* Salto de página después de cada gráfica (controlado por helper) */
+      .page-break{
+        page-break-after: always !important;
+        break-after: always !important;
+      }
+    }
+    
+  /* --- Benchmark ficha: lista con wrap --- */
+  .bench-ficha-items{display:flex;flex-direction:column;gap:.25rem;margin-top:.25rem;}
+  .bench-item{display:flex;align-items:flex-start;gap:.5rem;}
+  .bench-name{white-space:normal;overflow-wrap:anywhere;line-height:1.25;}
+  .bench-ficha-muted{opacity:.7;font-size:.95rem;}
     </style>
     """
 
@@ -328,57 +430,150 @@ def tiny_table_print(df: pd.DataFrame):
     html = df.to_html(index=False, border=0, classes="dataframe")
     st.markdown(f'<div class="table-print">{html}</div>', unsafe_allow_html=True)
 
+def _month_end_from_anio_mes(df: pd.DataFrame, anio_col="ANIO", mes_col="MES", out_col="FECHA") -> pd.DataFrame:
+    d = df.copy()
+    d[anio_col] = pd.to_numeric(d[anio_col], errors="coerce")
+    d[mes_col] = pd.to_numeric(d[mes_col], errors="coerce")
+    d = d.dropna(subset=[anio_col, mes_col]).copy()
+
+    dt = pd.to_datetime(
+        d[anio_col].astype(int).astype(str) + "-" + d[mes_col].astype(int).astype(str).str.zfill(2) + "-01",
+        errors="coerce"
+    )
+    d[out_col] = (dt + pd.offsets.MonthEnd(0)).dt.normalize()
+    return d
+
+
+def _style_time_xaxis(fig: go.Figure, n_points: int, print_mode: bool):
+    # Rotación cuando hay muchos puntos
+    angle = -45 if n_points > 8 else 0
+    if print_mode and n_points > 6:
+        angle = -45
+
+    # Menos ticks cuando se amontona (más agresivo en impresión)
+    nticks = 6 if n_points > 12 else max(4, n_points)
+    if print_mode:
+        nticks = 5 if n_points > 10 else max(4, n_points)
+
+    fig.update_xaxes(
+        tickformat="%b-%Y",
+        tickangle=angle,
+        tickmode="auto",
+        nticks=nticks,
+        showgrid=True,
+        ticks="outside",
+        title=None
+    )
+
+
+
+def _style_fig_for_mode(fig: go.Figure, print_mode: bool):
+    """Aplica estilos base y etiquetas de datos (1 decimal) a las gráficas."""
+    fig.update_layout(
+        height=420 if not print_mode else 380,
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    # Puntos + etiquetas
+    try:
+        fig.update_traces(
+            selector=dict(type="scatter"),
+            mode="lines+markers+text",
+            texttemplate="%{y:.1f}%",
+            hovertemplate="%{y:.2f}%<extra></extra>",
+        )
+    except Exception:
+        pass
+
+    try:
+        fig.update_traces(
+            selector=dict(type="bar"),
+            texttemplate="%{y:.1f}%",
+            hovertemplate="%{y:.2f}%<extra></extra>",
+        )
+    except Exception:
+        pass
+
+    fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
+    return fig
+
+
+def render_print_block(title: str, fig: go.Figure, print_mode: bool, break_after: bool = True, footer_md: str | None = None):
+    """
+    - En impresión: título + gráfica juntos + salto de página después
+    - En normal: st.subheader + chart
+    """
+    if print_mode:
+        st.markdown(f'<div class="print-block"><div class="print-title">{title}</div>', unsafe_allow_html=True)
+        add_datapoints_to_fig(fig, decimals=1)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        if footer_md:
+            st.markdown(footer_md)
+        st.markdown('</div>', unsafe_allow_html=True)
+        if break_after:
+            st.markdown('<div class="page-break"></div>', unsafe_allow_html=True)
+    else:
+        st.subheader(title)
+        add_datapoints_to_fig(fig, decimals=1)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 # =========================
 #  HELPER: CONTRATOS POR ALIAS
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
-def get_contratos_por_alias(alias: str) -> list[int]:
+def get_contratos_por_alias(alias: str) -> pd.DataFrame:
     """
-    Regresa la lista de ID_CLIENTE asociados al ALIAS_CDM dado.
-    Se usa solo para poblar el multiselect de 'Contrato' en la barra lateral.
+    Regresa un DataFrame con los contratos del alias:
+    - ID_CLIENTE
+    - NOMBRE_CORTO
+
+    Se usa para poblar el multiselect de 'Contrato' mostrando NOMBRE_CORTO,
+    pero la lógica interna sigue trabajando con ID_CLIENTE.
     """
     alias = (alias or "").strip()
     if not alias or not PWD:
-        return []
+        return pd.DataFrame(columns=["ID_CLIENTE", "NOMBRE_CORTO"])
+
     try:
         dsn = oracledb.makedsn(HOST, PORT, sid=SID)
         conn = oracledb.connect(user=USER, password=PWD, dsn=dsn)
         df = pd.read_sql(
             """
-            SELECT DISTINCT ID_CLIENTE
+            SELECT DISTINCT ID_CLIENTE, NOMBRE_CORTO
             FROM SIAPII.V_M_CONTRATO_CDM
             WHERE ALIAS_CDM = :alias
-            ORDER BY ID_CLIENTE
+            ORDER BY NOMBRE_CORTO
             """,
             conn,
             params={"alias": alias},
         )
         conn.close()
     except Exception:
-        return []
-    if df.empty:
-        return []
-    # Devolver como lista de int
-    return sorted(df["ID_CLIENTE"].dropna().astype(int).tolist())
+        return pd.DataFrame(columns=["ID_CLIENTE", "NOMBRE_CORTO"])
+
+    df["ID_CLIENTE"] = df["ID_CLIENTE"].astype("Int64")
+    df["NOMBRE_CORTO"] = df["NOMBRE_CORTO"].fillna("").astype(str)
+    return df
 
 # =========================
 #  SIDEBAR (parámetros)
 # =========================
-# Estado inicial de parámetros aplicados (solo cambian al presionar "Actualizar")
 hoy = date.today()
-if "ALIAS_APPLIED" not in st.session_state:
-    st.session_state["ALIAS_APPLIED"] = DEFAULT_ALIAS
-if "Y_APPLIED" not in st.session_state:
-    st.session_state["Y_APPLIED"] = hoy.year
-if "M_APPLIED" not in st.session_state:
-    st.session_state["M_APPLIED"] = hoy.month
-if "INFL_APPLIED" not in st.session_state:
-    st.session_state["INFL_APPLIED"] = DEFAULT_INFL
-if "CONTRATOS_APPLIED" not in st.session_state:
-    st.session_state["CONTRATOS_APPLIED"] = []
 
+# ---- Defaults de session_state (una sola vez) ----
+st.session_state.setdefault("ALIAS_APPLIED", DEFAULT_ALIAS)
+st.session_state.setdefault("Y_APPLIED", hoy.year)
+st.session_state.setdefault("M_APPLIED", hoy.month)
+st.session_state.setdefault("INFL_APPLIED", DEFAULT_INFL)
+st.session_state.setdefault("CONTRATOS_APPLIED", [])            # IDs
+st.session_state.setdefault("CONTRATOS_LABELS_APPLIED", [])     # Labels (NOMBRE_CORTO)
+st.session_state.setdefault("NOMBRE_CORTO_FOCUS", "")           # Label foco (aplicado)
+st.session_state.setdefault("PRINT_MODE", False)
+
+# ---- Sidebar UI ----
 with st.sidebar:
-    # Tarjeta principal de parámetros
     st.markdown(
         """
         <div class="sb-card">
@@ -387,30 +582,53 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    with st.form("param_form"):
-        # Alias (cliente)
+    # (A) Modo impresión (no depende del submit)
+    print_mode = st.checkbox(
+        "Modo impresión",
+        value=bool(st.session_state.get("PRINT_MODE", False)),
+        help="Optimiza el diseño para imprimir o exportar a PDF (fondo blanco, márgenes y tipografías).",
+    )
+    st.session_state["PRINT_MODE"] = print_mode
+
+    # (B) Form con “Aplicar”
+    with st.form("param_form", clear_on_submit=False):
         alias_input = st.text_input(
             "Cliente (ALIAS_CDM)",
-            value=st.session_state.get("ALIAS_APPLIED", DEFAULT_ALIAS),
+            value=str(st.session_state.get("ALIAS_APPLIED", DEFAULT_ALIAS)),
             help="Alias del cliente tal como viene en V_M_CONTRATO_CDM (ALIAS_CDM).",
         ).strip().upper()
 
-        # Contratos según alias escrito
-        contratos_disponibles = get_contratos_por_alias(alias_input)
-        contratos_applied = st.session_state.get("CONTRATOS_APPLIED", [])
+        # Traer contratos del alias escrito (labels + ids)
+        df_ctos = get_contratos_por_alias(alias_input)
 
-        # Si no hay contratos aplicados todavía, por default todos los disponibles
-        if not contratos_applied:
-            contratos_default = contratos_disponibles
+        if df_ctos.empty:
+            opciones_labels = []
+            label_to_id = {}
         else:
-            # Filtrar solo los que sigan existiendo para ese alias
-            contratos_default = [c for c in contratos_applied if c in contratos_disponibles] or contratos_disponibles
+            df_ctos = df_ctos.copy()
+            df_ctos["NOMBRE_CORTO"] = df_ctos["NOMBRE_CORTO"].astype(str)
+            df_ctos["ID_CLIENTE"] = df_ctos["ID_CLIENTE"].astype(int)
 
-        contrato_sel = st.multiselect(
+            opciones_labels = df_ctos["NOMBRE_CORTO"].tolist()
+            label_to_id = dict(zip(df_ctos["NOMBRE_CORTO"], df_ctos["ID_CLIENTE"]))
+
+        # Defaults del multiselect basados en LO APLICADO
+        applied_labels = st.session_state.get("CONTRATOS_LABELS_APPLIED", [])
+        applied_ids = st.session_state.get("CONTRATOS_APPLIED", [])
+
+        # Reconstruir labels desde IDs si cambió el alias o no hay labels guardados
+        ids_to_label = {v: k for k, v in label_to_id.items()}
+        if (not applied_labels) and applied_ids:
+            applied_labels = [ids_to_label[i] for i in applied_ids if i in ids_to_label]
+
+        # Si no hay nada aplicado válido, default = todos los del alias
+        default_labels = [l for l in applied_labels if l in opciones_labels] if applied_labels else opciones_labels
+
+        contrato_sel_labels = st.multiselect(
             "Contrato",
-            options=contratos_disponibles,
-            default=contratos_default,
-            help="Selecciona uno o varios ID_CLIENTE asociados al alias.",
+            options=opciones_labels,
+            default=default_labels,
+            help="Selecciona uno o varios contratos (NOMBRE_CORTO).",
         )
 
         coly, colm = st.columns(2)
@@ -440,42 +658,52 @@ with st.sidebar:
             format="%.3f",
         )
 
-        # Botón para aplicar cambios (no se recalcula nada hasta presionar aquí)
         aplicar = st.form_submit_button("Actualizar")
 
         if aplicar:
+            # Guardar “aplicado”
             st.session_state["ALIAS_APPLIED"] = alias_input or DEFAULT_ALIAS
             st.session_state["Y_APPLIED"] = int(y_input)
             st.session_state["M_APPLIED"] = int(m_input)
             st.session_state["INFL_APPLIED"] = float(infl_input)
-            st.session_state["CONTRATOS_APPLIED"] = contrato_sel or contratos_disponibles
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            # Convertir labels → IDs aplicados
+            contrato_sel_ids = [label_to_id[l] for l in contrato_sel_labels if l in label_to_id]
 
-    # Tarjeta para modo impresión
-    st.markdown(
-        """
-        <div class="sb-card">
-          <div class="sb-title">Impresión</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    print_mode = st.checkbox("Vista de impresión", value=False)
-    st.markdown("</div>", unsafe_allow_html=True)
+            # Si no seleccionan nada => todos
+            if contrato_sel_ids:
+                st.session_state["CONTRATOS_APPLIED"] = contrato_sel_ids
+                st.session_state["CONTRATOS_LABELS_APPLIED"] = contrato_sel_labels
+            else:
+                all_ids = df_ctos["ID_CLIENTE"].dropna().astype(int).tolist() if not df_ctos.empty else []
+                st.session_state["CONTRATOS_APPLIED"] = all_ids
+                st.session_state["CONTRATOS_LABELS_APPLIED"] = opciones_labels
+
+            # Foco SOLO al aplicar
+            st.session_state["NOMBRE_CORTO_FOCUS"] = (
+                st.session_state["CONTRATOS_LABELS_APPLIED"][0]
+                if st.session_state["CONTRATOS_LABELS_APPLIED"]
+                else ""
+            )
+
+    st.markdown("</div>", unsafe_allow_html=True)  # cierra sb-card
+
 
 # =========================
 #  PARÁMETROS ACTIVOS (USADOS EN EL REPORTE)
 # =========================
-hoy = date.today()  # por si se usa en otros lados
-
 ALIAS_CDM = st.session_state.get("ALIAS_APPLIED", DEFAULT_ALIAS)
 y = int(st.session_state.get("Y_APPLIED", hoy.year))
 m = int(st.session_state.get("M_APPLIED", hoy.month))
 INFLACION_ANUAL = float(st.session_state.get("INFL_APPLIED", DEFAULT_INFL))
 
-# Contratos seleccionados
 CONTRATOS_SELECCIONADOS = st.session_state.get("CONTRATOS_APPLIED", [])
 CONTRATOS_KEY = tuple(sorted(CONTRATOS_SELECCIONADOS))  # para cache
+
+NOMBRE_CORTO_FOCUS = st.session_state.get("NOMBRE_CORTO_FOCUS", "")
+
+print_mode = bool(st.session_state.get("PRINT_MODE", False))
+
 
 # =========================
 #  FECHAS Y CONSTANTES VISUALES
@@ -491,8 +719,730 @@ TICKANGLE = 0 if print_mode else 45
 LEGEND_RIGHT = dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02)
 
 # =========================
-#  CONEXIONES / HELPERS
+#  BENCHMARKS: LOAD + BUILD
 # =========================
+
+import unicodedata
+
+REQUIRED_MAP_COLS = [
+    "ALIAS_CDM", "NOMBRE_CORTO", "PRODUCTO",
+    "BENCHMARK_LABEL", "FILE_KEY", "SHEET_NAME", "COL_NAME",
+    "PESO", "MODO"
+]
+
+def _norm_colname(s: str) -> str:
+    """
+    Normaliza headers del Excel:
+    - strip
+    - upper
+    - sin acentos
+    - espacios/guiones -> _
+    - colapsa __
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))  # quita acentos
+    s = s.upper()
+    for ch in [" ", "-", ".", "/", "\\", "(", ")", "[", "]", "{", "}", ":"]:
+        s = s.replace(ch, "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+def load_bench_map(map_path: Path, sheet_name=None) -> pd.DataFrame:
+    """
+    Carga Mapa_Benchmarks.xlsx tolerando headers "sucios".
+    - Normaliza nombres de columna
+    - Acepta sinónimos comunes
+    - Luego aplica tus normalizaciones de valores
+    """
+    _ensure_file(map_path, "Mapa_Benchmarks.xlsx")
+    df = pd.read_excel(map_path, sheet_name=sheet_name) if sheet_name else pd.read_excel(map_path)
+    df = df.copy()
+
+    # 1) Normaliza headers
+    orig_cols = list(df.columns)
+    df.columns = [_norm_colname(c) for c in df.columns]
+
+    # 2) Sinónimos / variantes (ajusta aquí si tu archivo usa otros nombres)
+    synonyms = {
+        # alias / contrato
+        "ALIAS": "ALIAS_CDM",
+        "ALIASCDM": "ALIAS_CDM",
+        "ALIAS_CDM_": "ALIAS_CDM",
+
+        "NOMBRECORTO": "NOMBRE_CORTO",
+        "NOMBRE_CORTO_": "NOMBRE_CORTO",
+        "CONTRATO": "NOMBRE_CORTO",
+
+        # producto
+        "ESTRATEGIA": "PRODUCTO",
+        "PRODUCTO_": "PRODUCTO",
+
+        # benchmark
+        "BENCHMARK": "BENCHMARK_LABEL",
+        "BENCHMARKS": "BENCHMARK_LABEL",
+        "BENCHMARK_LABEL_": "BENCHMARK_LABEL",
+        "INDICE": "BENCHMARK_LABEL",
+        "INDICE_LABEL": "BENCHMARK_LABEL",
+
+        # file
+        "ARCHIVO": "FILE_KEY",
+        "FILE": "FILE_KEY",
+        "FILEKEY": "FILE_KEY",
+
+        # sheet/col
+        "HOJA": "SHEET_NAME",
+        "SHEET": "SHEET_NAME",
+        "SHEETNAME": "SHEET_NAME",
+
+        "COLUMNA": "COL_NAME",
+        "COL": "COL_NAME",
+        "COLNAME": "COL_NAME",
+
+        # peso/modo
+        "WEIGHT": "PESO",
+        "PESOS": "PESO",
+
+        "TIPO": "MODO",
+    }
+
+    # Aplica synonyms SOLO si la columna destino no existe ya
+    rename_map = {}
+    for c in df.columns:
+        if c in synonyms and synonyms[c] not in df.columns:
+            rename_map[c] = synonyms[c]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # 3) Valida requeridas
+    missing = [c for c in REQUIRED_MAP_COLS if c not in df.columns]
+    if missing:
+        # Debug útil: muestra qué columnas sí detectó
+        raise ValueError(
+            "[BENCH] Mapa_Benchmarks no trae columnas requeridas.\n"
+            f"Faltan: {missing}\n"
+            f"Columnas detectadas (normalizadas): {list(df.columns)}\n"
+            f"Columnas originales: {orig_cols}"
+        )
+
+    # 4) Normalizaciones de valores (igual que ya tenías)
+    df["ALIAS_CDM"] = df["ALIAS_CDM"].apply(_norm_upper)
+    df["NOMBRE_CORTO"] = df["NOMBRE_CORTO"].apply(_norm_str)
+    df["PRODUCTO"] = df["PRODUCTO"].apply(_norm_str)
+    df["BENCHMARK_LABEL"] = df["BENCHMARK_LABEL"].apply(_norm_str)
+    df["FILE_KEY"] = df["FILE_KEY"].apply(_norm_upper)
+    df["SHEET_NAME"] = df["SHEET_NAME"].apply(_norm_str)
+    df["COL_NAME"] = df["COL_NAME"].apply(_norm_str)
+    df["MODO"] = df["MODO"].apply(_norm_upper)
+    df["PESO"] = pd.to_numeric(df["PESO"], errors="coerce").fillna(0.0)
+
+    return df
+
+
+def _norm_str(x):
+    return "" if pd.isna(x) else str(x).strip()
+
+def _norm_upper(x):
+    return _norm_str(x).upper()
+
+def _ensure_file(path: Path, label: str):
+    if path is None:
+        raise FileNotFoundError(f"[BENCH] Path None para {label}")
+    if not Path(path).exists():
+        raise FileNotFoundError(f"[BENCH] No existe el archivo {label}: {path}")
+
+def _read_index_file(file_path: Path, sheet_name: str):
+    """
+    Lee archivo de índices (xlsx/xlsb) y devuelve DF con:
+      - columna 'FECHA' (datetime)
+      - columnas de índices numéricas (float)
+    """
+    _ensure_file(file_path, f"bench file {file_path.name}")
+
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".xlsb":
+        df = pd.read_excel(file_path, sheet_name=sheet_name, engine="pyxlsb")
+    else:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+    if df.shape[1] < 2:
+        raise ValueError(f"[BENCH] Hoja {sheet_name} en {file_path.name} no tiene columnas suficientes.")
+
+    # Primera columna es FECHA (diaria)
+    fecha_col = df.columns[0]
+    df = df.rename(columns={fecha_col: "FECHA"}).copy()
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+    df = df.dropna(subset=["FECHA"]).sort_values("FECHA")
+    df = df.drop_duplicates(subset=["FECHA"], keep="last")
+
+    # Convertir columnas de índices a numérico
+    for c in df.columns[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+def get_bench_rows(df_map: pd.DataFrame, alias_cdm: str, nombre_corto: str, producto: str | None = None) -> pd.DataFrame:
+    """
+    Filtra filas del mapa para un contrato (ALIAS_CDM + NOMBRE_CORTO) y opcional PRODUCTO.
+    - Si producto es None: trae todas las filas del contrato (útil para benchmark de portafolio).
+    - Si producto se pasa: filtra por ese producto.
+    """
+    alias_u = _norm_upper(alias_cdm)
+    nombre = _norm_str(nombre_corto)
+
+    sub = df_map[(df_map["ALIAS_CDM"] == alias_u) & (df_map["NOMBRE_CORTO"] == nombre)].copy()
+
+    if producto is not None:
+        prod = _norm_str(producto)
+        sub = sub[sub["PRODUCTO"] == prod].copy()
+
+    return sub
+
+def build_benchmark_series(df_map_rows: pd.DataFrame, bench_files: dict) -> pd.DataFrame:
+    """
+    Construye serie benchmark (compuesta por pesos) a partir de las filas del mapa ya filtradas.
+    Devuelve DF:
+      FECHA, BENCH (compuesto), y columnas individuales opcionales (por BENCHMARK_LABEL)
+    """
+    if df_map_rows.empty:
+        return pd.DataFrame(columns=["FECHA", "BENCH"])
+
+    # Validación: FILE_KEY debe existir en BENCH_FILES
+    missing_keys = sorted(set(df_map_rows["FILE_KEY"]) - set([k.upper() for k in bench_files.keys()]))
+    if missing_keys:
+        raise KeyError(f"[BENCH] FILE_KEY no existe en BENCH_FILES: {missing_keys}")
+
+    # Cargar archivos necesarios (cacheable por archivo+hoja)
+    # Nota: aquí lo hacemos simple. En Streamlit, cachea _read_index_file.
+    loaded = {}  # (FILE_KEY, SHEET_NAME) -> DF indices
+
+    parts = []
+    for _, r in df_map_rows.iterrows():
+        file_key = _norm_upper(r["FILE_KEY"])
+        sheet = _norm_str(r["SHEET_NAME"]) or "indices"
+        col = _norm_str(r["COL_NAME"])
+        label = _norm_str(r["BENCHMARK_LABEL"]) or col
+        peso = float(r["PESO"])
+
+        file_path = bench_files[file_key] if file_key in bench_files else bench_files[file_key.upper()]
+        k = (file_key, sheet)
+
+        if k not in loaded:
+            loaded[k] = _read_index_file(Path(file_path), sheet)
+
+        df_idx = loaded[k]
+
+        if col not in df_idx.columns:
+            # A veces el encabezado trae espacios raros: intentamos match por strip
+            cols_strip = {str(c).strip(): c for c in df_idx.columns}
+            if col in cols_strip:
+                col_real = cols_strip[col]
+            else:
+                raise KeyError(
+                    f"[BENCH] COL_NAME '{col}' no existe en {file_key}:{Path(file_path).name} hoja '{sheet}'. "
+                    f"Ejemplo columnas: {list(df_idx.columns)[:8]}"
+                )
+        else:
+            col_real = col
+
+        tmp = df_idx[["FECHA", col_real]].rename(columns={col_real: label}).copy()
+        tmp[label] = tmp[label].astype(float)
+        tmp["_PESO_"] = peso
+        tmp["_LABEL_"] = label
+        parts.append(tmp)
+
+    # Unir por FECHA todas las series individuales
+    # Creamos un DF master con fechas
+    df_all = None
+    for tmp in parts:
+        label = tmp["_LABEL_"].iloc[0]
+        tmp2 = tmp[["FECHA", label]].copy()
+        df_all = tmp2 if df_all is None else df_all.merge(tmp2, on="FECHA", how="outer")
+
+    df_all = df_all.sort_values("FECHA")
+
+    # Cálculo del BENCH compuesto por pesos:
+    # - Si hay MULTI con varias líneas 100, se suman (equivalente a promediar o sumar? -> aquí blend por pesos)
+    # - Si pesos no suman 100, normalizamos por suma de pesos > 0.
+    weights = {}
+    for _, r in df_map_rows.iterrows():
+        label = _norm_str(r["BENCHMARK_LABEL"]) or _norm_str(r["COL_NAME"])
+        weights[label] = weights.get(label, 0.0) + float(r["PESO"])
+
+    # normaliza pesos
+    total_w = sum(w for w in weights.values() if w > 0)
+    if total_w <= 0:
+        # si todo viene en 0 (error de mapa), devolvemos vacío
+        df_all["BENCH"] = np.nan
+        return df_all[["FECHA", "BENCH"]]
+
+    for k in list(weights.keys()):
+        weights[k] = weights[k] / total_w
+
+    # BENCH = suma(w_i * serie_i)
+    bench = None
+    for label, w in weights.items():
+        if label not in df_all.columns:
+            # por si label era col_name pero en df_all se guardó con BENCHMARK_LABEL
+            continue
+        s = df_all[label]
+        bench = (s * w) if bench is None else (bench + s * w)
+
+    df_all["BENCH"] = bench
+
+    return df_all[["FECHA", "BENCH"] + [c for c in df_all.columns if c not in ["FECHA", "BENCH"]]]
+
+def _is_portafolio_total(x: str) -> bool:
+    return str(x or "").strip().upper() == "PORTAFOLIO TOTAL"
+
+def build_bench_pack_from_map(
+    bench_map_df: pd.DataFrame,
+    alias_cdm: str,
+    nombre_corto: str,
+    producto: str | None,
+    bench_files: dict,
+) -> pd.DataFrame:
+    """
+    Devuelve DF mensual a cierre de mes con:
+      FECHA (month-end), ANIO, MES, BENCH_M, BENCH_YTD, BENCH_M_ANUAL, BENCH_YTD_ANUAL
+
+    producto:
+      - None => usa SOLO filas del mapa con PRODUCTO tipo 'PORTAFOLIO TOTAL'
+      - str  => usa SOLO filas del mapa con PRODUCTO = <producto> (y excluye portafolio total)
+    """
+
+    def _is_portafolio_total(x: str) -> bool:
+        s = str(x).strip().upper()
+        return s in ("PORTAFOLIO TOTAL", "PORTAFOLIO", "TOTAL", "TOTAL PORTAFOLIO")
+
+    # base checks
+    if bench_map_df is None or bench_map_df.empty:
+        return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
+
+    a = str(alias_cdm).strip().upper()
+    nc = str(nombre_corto).strip()
+
+    dfm = bench_map_df.copy()
+
+    # normaliza columnas relevantes
+    for c in ["ALIAS_CDM", "NOMBRE_CORTO", "PRODUCTO", "FILE_KEY", "SHEET_NAME", "COL_NAME", "MODO"]:
+        if c in dfm.columns:
+            dfm[c] = dfm[c].astype(str).str.strip()
+
+    if "ALIAS_CDM" in dfm.columns:
+        dfm["ALIAS_CDM"] = dfm["ALIAS_CDM"].str.upper()
+    if "FILE_KEY" in dfm.columns:
+        dfm["FILE_KEY"] = dfm["FILE_KEY"].str.upper()
+    if "MODO" in dfm.columns:
+        dfm["MODO"] = dfm["MODO"].str.upper()
+
+    # 1) filtra por alias + nombre_corto
+    rows = dfm[(dfm["ALIAS_CDM"] == a) & (dfm["NOMBRE_CORTO"] == nc)].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
+    
+    bench_label = "Benchmark"  # leyenda corta; detalles en la ficha abajo
+
+    if "BENCHMARK_LABEL" in rows.columns:
+        labs = rows["BENCHMARK_LABEL"].astype(str).str.strip()
+        labs = [x for x in labs.tolist() if x and x.lower() != "nan"]
+    else:
+        labs = []
+        bench_label = "Benchmark"  # leyenda corta; detalles en la ficha abajo
+
+    # 2) filtra por producto según regla
+    if producto is None:
+        rows = rows[rows["PRODUCTO"].apply(_is_portafolio_total)].copy()
+    else:
+        prod_u = str(producto).strip().upper()
+        rows = rows[~rows["PRODUCTO"].apply(_is_portafolio_total)].copy()
+        rows["__PROD_U__"] = rows["PRODUCTO"].astype(str).str.strip().str.upper()
+        rows = rows[rows["__PROD_U__"] == prod_u].copy()
+        rows = rows.drop(columns=["__PROD_U__"], errors="ignore")
+
+    if rows.empty:
+        return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
+
+    # 3) validar FILE_KEY exista
+    fks = sorted(rows["FILE_KEY"].dropna().astype(str).str.upper().unique().tolist())
+    missing_fk = [k for k in fks if k not in bench_files]
+    if missing_fk:
+        # opcional: loguea warning
+        return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
+
+    # 4) construir niveles diarios compuestos
+    bench_levels = build_benchmark_series(rows, bench_files)  # FECHA diaria, BENCH nivel
+    if bench_levels is None or bench_levels.empty or "BENCH" not in bench_levels.columns:
+        return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
+
+    b = bench_levels.copy()
+    b["FECHA"] = pd.to_datetime(b["FECHA"], errors="coerce")
+    b = b.dropna(subset=["FECHA"]).sort_values("FECHA")
+    b["MES"] = b["FECHA"].dt.to_period("M").dt.to_timestamp("M")  # month-end
+
+    # 5) último nivel de cada mes (cierre de mes)
+    me = (b.groupby("MES", as_index=False)["BENCH"].last()
+            .dropna(subset=["BENCH"])
+            .sort_values("MES"))
+
+    # 6) rendimientos
+    me["BENCH_M"] = me["BENCH"].pct_change()
+    me["ANIO"] = me["MES"].dt.year
+    me["MES_N"] = me["MES"].dt.month
+
+    first_y = me.groupby("ANIO")["BENCH"].transform("first")
+    me["BENCH_YTD"] = (me["BENCH"] / first_y) - 1.0
+
+    # anualizados para toggle
+    me["BENCH_M_ANUAL"] = (1.0 + me["BENCH_M"])**12 - 1.0
+    me["N_MES_EN_ANIO"] = me.groupby("ANIO").cumcount() + 1
+    me["BENCH_YTD_ANUAL"] = (1.0 + me["BENCH_YTD"])**(12.0 / me["N_MES_EN_ANIO"]) - 1.0
+
+    out = me.rename(columns={"MES": "FECHA", "MES_N": "MES"})[
+        ["FECHA", "ANIO", "MES", "BENCH_M", "BENCH_YTD", "BENCH_M_ANUAL", "BENCH_YTD_ANUAL"]
+    ].copy()
+
+    # asegurar month-end y sin duplicados
+    out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce")
+    out = out.dropna(subset=["FECHA"])
+    out["FECHA"] = out["FECHA"].dt.to_period("M").dt.to_timestamp("M")
+    out = out.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
+    out["BENCH_LABEL"] = bench_label
+
+    return out
+
+
+
+# =========================
+#  BENCHMARKS: LEVELS -> RETURNS (MONTH-END)
+# =========================
+# =========================
+#  BENCHMARKS · FICHA + KPI VS BENCH
+# =========================
+def get_bench_ficha_rows(alias_cdm: str, nombre_corto_focus: str | None, producto: str | None, modo: str | None = None) -> pd.DataFrame:
+    """Devuelve las filas del Mapa_Benchmarks para construir la ficha del benchmark.
+    - Para contrato (portafolio): producto=None
+    - Para producto: producto=<nombre producto>
+    """
+    try:
+        bm = load_bench_map(BENCH_MAP_FILE)
+    except Exception:
+        return pd.DataFrame()
+    return get_bench_map_rows(bm, alias_cdm, nombre_corto_focus, producto, modo)
+
+def calc_kpis_vs_benchmark(
+    prod_m: pd.Series,
+    prod_ytd: pd.Series,
+    bench_m: pd.Series,
+    bench_ytd: pd.Series
+) -> dict:
+    """KPIs comparativos (producto/contrato vs benchmark) en puntos porcentuales."""
+    out = {}
+    def _last(s: pd.Series):
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return None if s.empty else float(s.iloc[-1])
+    pm = _last(prod_m); py = _last(prod_ytd)
+    bm = _last(bench_m); by = _last(bench_ytd)
+    if pm is not None and bm is not None:
+        out["m_prod"] = pm * 100.0
+        out["m_bench"] = bm * 100.0
+        out["m_delta_pp"] = (pm - bm) * 100.0
+    if py is not None and by is not None:
+        out["ytd_prod"] = py * 100.0
+        out["ytd_bench"] = by * 100.0
+        out["ytd_delta_pp"] = (py - by) * 100.0
+    return out
+
+def render_benchmark_ficha(df_rows: pd.DataFrame, modo: str, title: str = "Benchmark"):
+    """Ficha compacta del benchmark (composición) para poner debajo de las gráficas.
+
+    Espera columnas (al menos):
+      - NOMBRE_BENCH (o BENCH_NAME)
+      - PESO (en %)
+      - TIPO (Nivel / Portafolio / Producto) [opcional]
+    """
+    if df_rows is None or getattr(df_rows, "empty", True):
+        return
+
+    df_show = df_rows.copy()
+
+    # Normalizar nombres de columnas
+    if "NOMBRE_BENCH" not in df_show.columns and "BENCH_NAME" in df_show.columns:
+        df_show["NOMBRE_BENCH"] = df_show["BENCH_NAME"]
+
+    if "PESO" not in df_show.columns:
+        df_show["PESO"] = None
+
+    # Header
+    st.markdown(f"**{title}**")
+
+    # Lista (wrap natural)
+    items = []
+    for _, r in df_show.iterrows():
+        nombre = str(r.get("NOMBRE_BENCH", "")).strip()
+        peso = r.get("PESO", None)
+        tipo = str(r.get("TIPO", "")).strip()
+
+        peso_txt = ""
+        try:
+            if pd.notna(peso):
+                peso_txt = f"{float(peso):.1f}% — "
+        except Exception:
+            pass
+
+        tipo_txt = f" <span style='opacity:.70'>({tipo})</span>" if tipo else ""
+        items.append(f"<li><span style='font-weight:600'>{peso_txt}</span>{nombre}{tipo_txt}</li>")
+
+    html = "<ul style='margin-top:.25rem;margin-bottom:.25rem; padding-left:1.2rem'>" + "".join(items) + "</ul>"
+    st.markdown(html, unsafe_allow_html=True)
+
+    # Tabla opcional en expander
+    with st.expander("Ver detalle de composición", expanded=False):
+        df_tab = df_show[[c for c in ["NOMBRE_BENCH", "PESO", "TIPO"] if c in df_show.columns]].copy()
+        if "PESO" in df_tab.columns:
+            df_tab["PESO"] = df_tab["PESO"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
+        st.dataframe(df_tab, use_container_width=True, hide_index=True)
+
+
+# -------------------------------------------------------------------
+#  Benchmark footer (texto bajo gráfica)
+# -------------------------------------------------------------------
+BENCH_DISCLAIMER_MD = (
+    "> **Nota:** En `Mapa_Benchmarks.xlsx`, la columna **MODO** se refiere al tipo de benchmark "
+    "(p.ej. **BLEND** / **MULTI**).\n"
+    "> La convención **anualizado vs efectivo** se define en el script: "
+    "Portafolio y Deuda se presentan **anualizados**, y Renta Variable se presenta **efectiva**."
+)
+
+def bench_ficha_to_markdown(df_rows: pd.DataFrame, title: str = "Benchmark", include_disclaimer: bool = True) -> str:
+    """Convierte las filas del mapa (BENCHMARK_LABEL + PESO + MODO) a markdown legible.
+    Se usa como texto bajo la gráfica (no renderiza tabla, solo texto).
+    """
+    if df_rows is None or df_rows.empty:
+        md = f"**{title}:** _Sin benchmark mapeado_"
+        if include_disclaimer:
+            md += "\n\n" + BENCH_DISCLAIMER_MD
+        return md
+
+    dfp = df_rows.copy()
+    # columnas esperadas: BENCHMARK_LABEL, PESO, MODO
+    label_col = "BENCHMARK_LABEL" if "BENCHMARK_LABEL" in dfp.columns else None
+    if label_col is None:
+        # fallback por si se llama distinto
+        for c in dfp.columns:
+            if "LABEL" in c.upper():
+                label_col = c
+                break
+
+    if label_col is None:
+        md = f"**{title}:** _Benchmark mapeado pero sin columna de label_"
+        if include_disclaimer:
+            md += "\n\n" + BENCH_DISCLAIMER_MD
+        return md
+
+    # arma lista de bullets con peso
+    lines = [f"**{title}:**"]
+    # MODO (blend/multi) como meta
+    modo_val = None
+    if "MODO" in dfp.columns:
+        vals = dfp["MODO"].dropna().astype(str).unique().tolist()
+        if len(vals) == 1:
+            modo_val = vals[0]
+    if modo_val:
+        lines.append(f"- _Modo:_ **{modo_val}**")
+
+    for _, r in dfp.iterrows():
+        lab = str(r.get(label_col, "")).strip()
+        if not lab:
+            continue
+        peso = r.get("PESO", None)
+        if peso is None or (isinstance(peso, float) and pd.isna(peso)):
+            lines.append(f"- {lab}")
+        else:
+            try:
+                p = float(peso)
+                lines.append(f"- {lab} — **{p:.0f}%**")
+            except Exception:
+                lines.append(f"- {lab} — **{peso}**")
+
+    if include_disclaimer:
+        lines.append("")
+        lines.append(BENCH_DISCLAIMER_MD)
+
+    return "\n".join(lines)
+
+def levels_to_returns(df_levels_m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Entrada: DF mensual con FECHA, BENCH_LEVEL
+    Salida: DF mensual con FECHA y retornos:
+      - RET_M: rendimiento mensual simple
+      - RET_M_ACUM: acumulado desde inicio
+    """
+    if df_levels_m is None or df_levels_m.empty:
+        return pd.DataFrame(columns=["FECHA", "RET_M", "RET_M_ACUM"])
+
+    df = df_levels_m.copy().sort_values("FECHA")
+    df["BENCH_LEVEL"] = pd.to_numeric(df["BENCH_LEVEL"], errors="coerce")
+    df = df.dropna(subset=["BENCH_LEVEL"])
+
+    df["RET_M"] = df["BENCH_LEVEL"].pct_change()
+    first = df["BENCH_LEVEL"].iloc[0]
+    df["RET_M_ACUM"] = df["BENCH_LEVEL"] / first - 1.0
+
+    return df[["FECHA", "RET_M", "RET_M_ACUM"]]
+
+def add_annualized_cols(df: pd.DataFrame, col_month: str, col_acum: str,
+                        out_month_ann: str, out_acum_ann: str) -> pd.DataFrame:
+    """
+    Anualiza:
+    - mensual: (1+r)^12 - 1
+    - acumulado: (1+R_acum)^(12/n) - 1, donde n es #meses desde inicio
+    """
+    df = df.copy().sort_values("FECHA")
+    df[col_month] = pd.to_numeric(df[col_month], errors="coerce")
+    df[col_acum] = pd.to_numeric(df[col_acum], errors="coerce")
+
+    df[out_month_ann] = (1.0 + df[col_month])**12 - 1.0
+
+    n = np.arange(1, len(df) + 1, dtype=float)
+    df[out_acum_ann] = (1.0 + df[col_acum])**(12.0 / n) - 1.0
+
+    return df
+
+def benchmark_returns_pack(df_bench_levels: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convierte niveles diarios del benchmark compuesto a formato 'rendimientos' compatible con Oracle:
+      FECHA (cierre de mes),
+      TASA, TASA_ACUMULADO,
+      TASA_EFECTIVA, TASA_EFECTIVA_ACUMULADO,
+      + anualizados
+    """
+    m_levels = bench_to_month_end_levels(df_bench_levels)
+    rets = levels_to_returns(m_levels)
+
+    out = rets.rename(columns={"RET_M": "TASA", "RET_M_ACUM": "TASA_ACUMULADO"}).copy()
+
+    # Compatibilidad: si tu negocio no distingue "efectiva" para bench, igualamos
+    out["TASA_EFECTIVA"] = out["TASA"]
+    out["TASA_EFECTIVA_ACUMULADO"] = out["TASA_ACUMULADO"]
+
+    # Anualizados (para tu toggle)
+    out = add_annualized_cols(out, "TASA", "TASA_ACUMULADO", "TASA_ANUALIZADA", "TASA_ACUM_ANUALIZADA")
+    out = add_annualized_cols(out, "TASA_EFECTIVA", "TASA_EFECTIVA_ACUMULADO",
+                              "TASA_EFECTIVA_ANUALIZADA", "TASA_EFECTIVA_ACUM_ANUALIZADA")
+    return out
+
+def ensure_month_end_fecha(df: pd.DataFrame, anio_col="ANIO", mes_col="MES", fecha_col="FECHA") -> pd.DataFrame:
+    df = df.copy()
+    if fecha_col in df.columns:
+        df[fecha_col] = pd.to_datetime(df[fecha_col], errors="coerce")
+        return df
+
+    if anio_col in df.columns and mes_col in df.columns:
+        df[anio_col] = pd.to_numeric(df[anio_col], errors="coerce").astype("Int64")
+        df[mes_col] = pd.to_numeric(df[mes_col], errors="coerce").astype("Int64")
+        d = pd.to_datetime(df[anio_col].astype(str) + "-" + df[mes_col].astype(str).str.zfill(2) + "-01", errors="coerce")
+        df[fecha_col] = (d + pd.offsets.MonthEnd(0))
+        return df
+
+    raise ValueError("No puedo construir FECHA: falta FECHA o columnas ANIO/MES.")
+
+
+def _norm_prod_key(x: str) -> str:
+    return _norm_str(x).strip().upper()
+
+PORT_TOT_KEY = "PORTAFOLIO TOTAL"
+
+def bench_levels_to_monthly_returns(df_levels: pd.DataFrame) -> pd.DataFrame:
+    """
+    Entrada: df_levels con FECHA diaria y columnas numéricas (BENCH y/o labels individuales)
+    Salida: DF mensual cierre de mes con:
+      FECHA (month-end), y para cada serie X:
+        X_M   (mensual efectivo)
+        X_YTD (acumulado YTD efectivo)
+    """
+    if df_levels is None or df_levels.empty:
+        return pd.DataFrame()
+
+    df = df_levels.copy()
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+    df = df.dropna(subset=["FECHA"]).sort_values("FECHA")
+
+    # columnas numéricas (todas excepto FECHA)
+    val_cols = [c for c in df.columns if c != "FECHA"]
+    if not val_cols:
+        return pd.DataFrame()
+
+    # month-end bucket y último nivel del mes
+    df["MES"] = df["FECHA"].dt.to_period("M").dt.to_timestamp("M")  # month-end
+    last = df.groupby("MES")[val_cols].last().reset_index().rename(columns={"MES": "FECHA"})
+    last = last.dropna(subset=val_cols, how="all").sort_values("FECHA")
+
+    # returns
+    out = last[["FECHA"]].copy()
+    out["ANIO"] = out["FECHA"].dt.year
+    out["MES"]  = out["FECHA"].dt.month
+
+    for c in val_cols:
+        # mensual
+        out[f"{c}_M"] = last[c].pct_change()
+
+        # YTD
+        first_y = last.groupby(last["FECHA"].dt.year)[c].transform("first")
+        out[f"{c}_YTD"] = (last[c] / first_y) - 1.0
+
+    return out
+
+def get_bench_rows_scope(
+    df_map: pd.DataFrame,
+    alias_cdm: str,
+    nombre_corto: str,
+    producto: str | None
+) -> pd.DataFrame:
+    """
+    - producto == None: trae TODO el contrato (raro, normalmente no lo usamos)
+    - producto == 'PORTAFOLIO TOTAL': trae solo esas filas
+    - producto == '<nombre producto>': trae solo ese producto
+    """
+    sub = get_bench_rows(df_map, alias_cdm, nombre_corto, producto=None)
+    if sub.empty:
+        return sub
+
+    if producto is None:
+        return sub
+
+    pkey = _norm_prod_key(producto)
+    sub["_PRODKEY_"] = sub["PRODUCTO"].apply(_norm_prod_key)
+    return sub[sub["_PRODKEY_"] == pkey].drop(columns=["_PRODKEY_"], errors="ignore")
+
+@st.cache_data(show_spinner=False)
+def bench_monthly_pack_cached(
+    alias_cdm: str,
+    nombre_corto: str,
+    producto_scope: str
+) -> pd.DataFrame:
+    """
+    producto_scope:
+      - 'PORTAFOLIO TOTAL'  -> benchmark para Resumen (contrato)
+      - '<PRODUCTO>'        -> benchmark para rendimientos por producto
+    Devuelve DF con FECHA month-end + columnas tipo:
+      BENCH_M, BENCH_YTD, <label>_M, <label>_YTD, etc.
+    """
+    rows = get_bench_rows_scope(bench_map_df, alias_cdm, nombre_corto, producto_scope)
+    if rows.empty:
+        return pd.DataFrame()
+
+    df_levels = build_benchmark_series(rows, BENCH_FILES)  # FECHA + BENCH + labels individuales
+    if df_levels.empty:
+        return pd.DataFrame()
+
+    df_pack = bench_levels_to_monthly_returns(df_levels)
+    return df_pack
+
 def get_conn():
     if not PWD:
         raise RuntimeError("Falta ORACLE_PWD en secrets o variable de entorno.")
@@ -502,6 +1452,21 @@ def get_conn():
     return oracledb.connect(user=USER, password=PWD, dsn=dsn)
 
 @st.cache_data(ttl=600, show_spinner=True)
+
+def bench_to_month_end_levels(df_levels: pd.DataFrame) -> pd.DataFrame:
+    """Niveles diarios -> niveles a cierre de mes (month-end)."""
+    if df_levels is None or df_levels.empty:
+        return pd.DataFrame(columns=["FECHA", "LEVEL"])
+    df = df_levels.copy()
+    df["FECHA"] = pd.to_datetime(df["FECHA"])
+    df = df.sort_values("FECHA")
+    df["FECHA_ME"] = df["FECHA"] + pd.offsets.MonthEnd(0)
+    out = (df.groupby("FECHA_ME", as_index=False)
+             .agg(LEVEL=("LEVEL", "last"))
+             .rename(columns={"FECHA_ME": "FECHA"}))
+    return out
+
+
 def run_sql(sql: str, params: dict | None = None) -> pd.DataFrame:
     conn = get_conn()
     return pd.read_sql(sql, conn, params=params or {})
@@ -610,6 +1575,61 @@ def _to_dec(x):
         return v if 0 <= v <= 1 else v/100.0
     except:
         return np.nan
+
+def build_yearly_accum_series(
+    df: pd.DataFrame,
+    modo: str,
+    y_ref: int,
+    m_ref: int,
+    n_years: int = 5,
+    producto: str | None = None
+):
+    if df is None or df.empty:
+        return [], []
+
+    d = df.copy()
+
+    # filtro producto robusto
+    if producto is not None and "PRODUCTO" in d.columns:
+        prod_u = str(producto).strip().upper()
+        d["__PROD__"] = d["PRODUCTO"].astype(str).str.strip().str.upper()
+        d = d[d["__PROD__"] == prod_u].copy()
+        if d.empty:
+            return [], []
+
+    col = "TASA_ACUM_ANUAL" if modo == "Anualizado" else "TASA_ACUM_EFEC"
+    if col not in d.columns:
+        return [], []
+
+    d[col] = pd.to_numeric(d[col], errors="coerce")
+
+    years = list(range(int(y_ref) - (n_years - 1), int(y_ref) + 1))
+    x_labels = [str(y) for y in years]
+    y_vals = []
+
+    for yy in years:
+        sub = d[d["ANIO"] == yy].copy()
+        if sub.empty:
+            y_vals.append(np.nan)
+            continue
+
+        # año actual: último mes <= m_ref; años pasados: dic si existe, si no último mes
+        if yy == int(y_ref):
+            sub = sub[sub["MES"] <= int(m_ref)].copy()
+            if sub.empty:
+                y_vals.append(np.nan)
+                continue
+            row = sub.sort_values("MES").iloc[-1]
+        else:
+            if (sub["MES"] == 12).any():
+                row = sub[sub["MES"] == 12].sort_values("MES").iloc[-1]
+            else:
+                row = sub.sort_values("MES").iloc[-1]
+
+        v = row.get(col)
+        y_vals.append(float(v) * 100.0 if pd.notna(v) else np.nan)
+
+    return x_labels, y_vals
 
 # =========================
 #  Rendimientos contrato 12m
@@ -774,6 +1794,154 @@ def rend_bruto_producto_hist_12m(alias: str, anio: int, mes: int, contratos_key:
         "TASA_M_ANUAL","TASA_ACUM_ANUAL",
         "TASA_M_EFEC","TASA_ACUM_EFEC"
     ]]
+
+# =========================
+#  Rendimientos 5 años (para acumulado anual por año)
+# =========================
+@st.cache_data(ttl=900, show_spinner=True)
+def rend_bruto_contrato_hist_n_years(alias: str, anio: int, mes: int, n_years: int = 5,
+                                    contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
+    ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
+    start = pd.Timestamp(year=int(anio) - (n_years - 1), month=1, day=1)
+    end   = (ref + pd.offsets.MonthEnd(0))
+
+    filtro_cts, extra_params = build_contrato_filter_sql(contratos_key, "ID_CLIENTE", "cid_rc5")
+
+    sql = f"""
+    WITH CTS AS (
+      SELECT ID_CLIENTE
+      FROM SIAPII.V_M_CONTRATO_CDM
+      WHERE ALIAS_CDM = :alias
+      {filtro_cts}
+    )
+    SELECT
+        r.ANIO,
+        r.MES,
+        r.TASA,
+        r.TASA_ACUMULADO,
+        r.TASA_EFECTIVA,
+        r.TASA_EFECTIVA_ACUMULADO
+    FROM SIAPII.V_RENDIMIENTO_CTO r
+    JOIN CTS c ON c.ID_CLIENTE = r.ID_CLIENTE
+    WHERE UPPER(r.TIPO_RENDIMIENTO) LIKE 'GESTION BRUTA'
+      AND r.NIVEL = 'CONTRATO'
+      AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
+          BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
+    """
+    params = {"alias": alias, "d_ini": start.strftime("%Y-%m-%d"), "d_fin": end.strftime("%Y-%m-%d")}
+    params.update(extra_params)
+
+    df = run_sql(sql, params)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "ANIO","MES",
+            "TASA_M_ANUAL","TASA_ACUM_ANUAL",
+            "TASA_M_EFEC","TASA_ACUM_EFEC"
+        ])
+
+    df = df.sort_values(["ANIO","MES"]).groupby(["ANIO","MES"], as_index=False).last()
+    df["TASA_M_ANUAL"]    = df["TASA"].apply(_to_dec)
+    df["TASA_ACUM_ANUAL"] = df["TASA_ACUMULADO"].apply(_to_dec)
+    df["TASA_M_EFEC"]     = df["TASA_EFECTIVA"].apply(_to_dec)
+    df["TASA_ACUM_EFEC"]  = df["TASA_EFECTIVA_ACUMULADO"].apply(_to_dec)
+    return df[["ANIO","MES","TASA_M_ANUAL","TASA_ACUM_ANUAL","TASA_M_EFEC","TASA_ACUM_EFEC"]]
+
+
+@st.cache_data(ttl=900, show_spinner=True)
+def rend_bruto_producto_hist_n_years(alias: str, anio: int, mes: int, n_years: int = 5,
+                                     contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
+    ref = pd.Timestamp(year=int(anio), month=int(mes), day=1)
+    start = pd.Timestamp(year=int(anio) - (n_years - 1), month=1, day=1)
+    end   = (ref + pd.offsets.MonthEnd(0))
+
+    tiene_nivel_prod = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'NIVEL_PRODUCTO')
+    filtro_nivel = "AND r.NIVEL_PRODUCTO = 'SI'" if tiene_nivel_prod else ""
+
+    has_idcdm_cto = _col_exists('SIAPII', 'V_M_CONTRATO_CDM', 'ID_CDM')
+    has_idcdm_rp  = _col_exists('SIAPII', 'V_RENDIMIENTO_PROD', 'ID_CDM')
+
+    if has_idcdm_cto and has_idcdm_rp:
+        filtro_cts, extra_params = build_contrato_filter_sql(contratos_key, "ID_CLIENTE", "cid_rp5a")
+        sql = f"""
+        WITH CTS AS (
+            SELECT DISTINCT ID_CDM
+            FROM SIAPII.V_M_CONTRATO_CDM
+            WHERE ALIAS_CDM = :alias
+            {filtro_cts}
+        )
+        SELECT
+            r.ANIO,
+            r.MES,
+            r.ID_PRODUCTO,
+            COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
+            r.TASA,
+            r.TASA_EFECTIVA,
+            r.TASA_ACUMULADO,
+            r.TASA_EFECTIVA_ACUMULADO
+        FROM SIAPII.V_RENDIMIENTO_PROD r
+        JOIN CTS c
+          ON c.ID_CDM = r.ID_CDM
+        LEFT JOIN SIAPII.V_M_PRODUCTO p
+          ON p.ID_PRODUCTO = r.ID_PRODUCTO
+        WHERE UPPER(r.TIPO_RENDIMIENTO) = 'GESTION BRUTA'
+          {filtro_nivel}
+          AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
+              BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
+        """
+        params = {"alias": alias, "d_ini": start.strftime("%Y-%m-%d"), "d_fin": end.strftime("%Y-%m-%d")}
+        params.update(extra_params)
+    else:
+        filtro_pa, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_rp5b")
+        sql = f"""
+        WITH PROD_ALIAS AS (
+            SELECT DISTINCT e.ID_PRODUCTO
+            FROM SIAPII.V_CLIENTE_ESTADISTICAS e
+            JOIN SIAPII.V_M_CONTRATO_CDM c
+              ON c.ID_CLIENTE = e.ID_CLIENTE
+            WHERE c.ALIAS_CDM = :alias
+              {filtro_pa}
+        )
+        SELECT
+            r.ANIO,
+            r.MES,
+            r.ID_PRODUCTO,
+            COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION') AS PRODUCTO,
+            r.TASA,
+            r.TASA_EFECTIVA,
+            r.TASA_ACUMULADO,
+            r.TASA_EFECTIVA_ACUMULADO
+        FROM SIAPII.V_RENDIMIENTO_PROD r
+        JOIN PROD_ALIAS pa
+          ON pa.ID_PRODUCTO = r.ID_PRODUCTO
+        LEFT JOIN SIAPII.V_M_PRODUCTO p
+          ON p.ID_PRODUCTO = r.ID_PRODUCTO
+        WHERE UPPER(r.TIPO_RENDIMIENTO) = 'GESTION BRUTA'
+          {filtro_nivel}
+          AND TRUNC(TO_DATE(r.ANIO || '-' || LPAD(r.MES,2,'0') || '-01', 'YYYY-MM-DD'))
+              BETWEEN TO_DATE(:d_ini,'YYYY-MM-DD') AND TO_DATE(:d_fin,'YYYY-MM-DD')
+        """
+        params = {"alias": alias, "d_ini": start.strftime("%Y-%m-%d"), "d_fin": end.strftime("%Y-%m-%d")}
+        params.update(extra_params)
+
+    df = run_sql(sql, params)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "ANIO","MES","ID_PRODUCTO","PRODUCTO",
+            "TASA_M_ANUAL","TASA_ACUM_ANUAL",
+            "TASA_M_EFEC","TASA_ACUM_EFEC"
+        ])
+
+    df = (
+        df.sort_values(["ANIO","MES","ID_PRODUCTO"])
+          .groupby(["ANIO","MES","ID_PRODUCTO","PRODUCTO"], as_index=False)
+          .last()
+    )
+    df["TASA_M_ANUAL"]    = df["TASA"].apply(_to_dec)
+    df["TASA_M_EFEC"]     = df["TASA_EFECTIVA"].apply(_to_dec)
+    df["TASA_ACUM_ANUAL"] = df["TASA_ACUMULADO"].apply(_to_dec)
+    df["TASA_ACUM_EFEC"]  = df["TASA_EFECTIVA_ACUMULADO"].apply(_to_dec)
+    return df[["ANIO","MES","ID_PRODUCTO","PRODUCTO","TASA_M_ANUAL","TASA_ACUM_ANUAL","TASA_M_EFEC","TASA_ACUM_EFEC"]]
+
 
 def _annualize_from_effective(tef_dec, plazo_dias):
     tef = pd.to_numeric(pd.Series(tef_dec), errors='coerce')
@@ -1553,6 +2721,8 @@ with st.spinner("Consultando Oracle / Postgres y construyendo vistas…"):
 cto_m_anual, cto_ytd_anual, df_rend_prod = rend_bruto_contrato_y_producto(ALIAS_CDM, y, m, CONTRATOS_KEY)
 df_hist_rend      = rend_bruto_contrato_hist_12m(ALIAS_CDM, y, m, CONTRATOS_KEY)
 df_hist_rend_prod = rend_bruto_producto_hist_12m(ALIAS_CDM, y, m, CONTRATOS_KEY)
+df_hist_rend_5y      = rend_bruto_contrato_hist_n_years(ALIAS_CDM, y, m, n_years=5, contratos_key=CONTRATOS_KEY)
+df_hist_rend_prod_5y = rend_bruto_producto_hist_n_years(ALIAS_CDM, y, m, n_years=5, contratos_key=CONTRATOS_KEY)
 
 with st.spinner("Calculando Deuda…"):
     df_snap_deuda = query_snapshot_deuda(ALIAS_CDM, F_DIA_INI, F_DIA_FIN_NEXT, CONTRATOS_KEY)
@@ -1663,67 +2833,188 @@ def area100_from_pivot(pvt: pd.DataFrame, title: str, height=BARH_H, tickvals=No
     )
     return fig
 
-# =========================
-#  Helper rendimientos por producto (gráfica)
-# =========================
-def plot_rend_producto_series(df_hist_prod: pd.DataFrame, producto: str, modo: str, titulo_prefix: str):
-    dfp = df_hist_prod[df_hist_prod["PRODUCTO"] == producto].copy()
+def plot_rend_producto_series(
+    df_hist_prod_12m: pd.DataFrame,
+    df_hist_prod_5y: pd.DataFrame,
+    producto: str,
+    modo: str,
+    bench_pack: pd.DataFrame | None = None
+):
+    """
+    Grafica:
+      - Mensual 12m (Oracle) + Benchmark mensual
+      - Acumulado por año 5y (Oracle) + Benchmark anual (1 punto por año)
+    Reglas:
+      - Eje X real (FECHA month-end)
+      - Rotación automática si se amontona (más en impresión)
+      - Puntos visibles
+      - Tooltips sin decimales
+      - Etiquetas sin decimales en impresión
+      - Leyenda con nombre real del benchmark si viene BENCH_LABEL
+    """
+
+    # -------- Mensual (12m) --------
+    dfp = df_hist_prod_12m[df_hist_prod_12m["PRODUCTO"] == producto].copy()
     if dfp.empty:
         st.info("Sin rendimientos disponibles para este producto.")
         return
-    dfp = dfp.sort_values(["ANIO","MES"])
-    fechas = pd.to_datetime(dict(year=dfp["ANIO"], month=dfp["MES"], day=1), errors="coerce")
-    dfp["LABEL"] = fechas.dt.strftime("%b-%y")
-    if modo == "Anualizado":
-        col_m = "TASA_M_ANUAL"
-        col_a = "TASA_ACUM_ANUAL"
-    else:
-        col_m = "TASA_M_EFEC"
-        col_a = "TASA_ACUM_EFEC"
-    m_vals = (dfp[col_m] * 100.0).round(2)
-    a_vals = (dfp[col_a] * 100.0).round(2)
-    x_labels = dfp["LABEL"].tolist()
-    m_vals_list = m_vals.tolist()
-    a_vals_list = a_vals.tolist()
-    sel = dfp[(dfp["ANIO"] == y) & (dfp["MES"] == m)]
-    ytd_val = np.nan
-    if not sel.empty and pd.notna(sel[col_a].iloc[0]):
-        ytd_val = float(sel[col_a].iloc[0] * 100.0)
-    x_labels_ext = x_labels + [f"Año {y}"]
-    m_vals_ext = m_vals_list + [np.nan]
-    a_vals_ext = a_vals_list + [ytd_val]
-    text_m = [f"{v:.2f}%" if isinstance(v, (int,float)) and not np.isnan(v) else "" for v in m_vals_ext]
-    text_a = [f"{v:.2f}%" if isinstance(v, (int,float)) and not np.isnan(v) else "" for v in a_vals_ext]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_labels_ext,
-        y=m_vals_ext,
-        name="Mensual",
-        hovertemplate="%{x}<br>Mensual: %{y:.2f}%<extra></extra>",
-        text=text_m,
-        textposition="outside"
-    ))
-    fig.add_trace(go.Bar(
-        x=x_labels_ext,
-        y=a_vals_ext,
-        name="Acumulado",
-        hovertemplate="%{x}<br>Acumulado: %{y:.2f}%<extra></extra>",
-        text=text_a,
-        textposition="outside"
-    ))
-    fig.update_layout(
-        barmode="group",
-        title=f"{titulo_prefix} — {producto}",
-        yaxis=dict(title="Rendimiento (%)"),
-        xaxis=dict(title="Mes", tickangle=0),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-        margin=dict(l=10, r=10, t=60, b=40),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        height=BARH_H
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
+    dfp = dfp.sort_values(["ANIO", "MES"]).copy()
+    dfp = _month_end_from_anio_mes(dfp, "ANIO", "MES", "FECHA")
+
+    # Merge benchmark SOLO por FECHA month-end
+    if bench_pack is not None and not bench_pack.empty:
+        bp = bench_pack.copy()
+        bp["FECHA"] = pd.to_datetime(bp["FECHA"], errors="coerce")
+        bp = bp.dropna(subset=["FECHA"]).copy()
+        bp["FECHA"] = (bp["FECHA"] + pd.offsets.MonthEnd(0)).dt.normalize()
+        bp = bp.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
+        dfp = dfp.merge(bp, on="FECHA", how="left")
+
+    # columnas Oracle
+    col_m = "TASA_M_ANUAL" if modo == "Anualizado" else "TASA_M_EFEC"
+    dfp[col_m] = pd.to_numeric(dfp[col_m], errors="coerce")
+    dfp = dfp.dropna(subset=["FECHA", col_m]).copy()
+    # (KPIs comparativos vs benchmark removidos por requerimiento)
+
+
+    # Figura mensual
+    fig_m = go.Figure()
+    y_port = dfp[col_m] * 100.0
+
+    fig_m.add_trace(go.Bar(
+        x=dfp["FECHA"],
+        y=y_port,
+        name="Portafolio",
+        text=[f"{v:.1f}%" for v in y_port],
+        hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
+    ))
+
+    # Benchmark mensual (respeta anualizado si existe BENCH_M_ANUAL)
+    bench_name = "Benchmark"
+    if "BENCH_LABEL" in dfp.columns and dfp["BENCH_LABEL"].notna().any():
+        bench_name = str(dfp["BENCH_LABEL"].dropna().iloc[-1])
+
+    if "BENCH_M" in dfp.columns:
+        bm = None
+        if modo == "Anualizado" and "BENCH_M_ANUAL" in dfp.columns:
+            bm = pd.to_numeric(dfp["BENCH_M_ANUAL"], errors="coerce")
+        else:
+            bm = pd.to_numeric(dfp["BENCH_M"], errors="coerce")
+
+        if bm is not None and bm.notna().any():
+            fig_m.add_trace(go.Bar(
+                x=dfp["FECHA"],
+                y=bm * 100.0,
+                name=bench_name,
+            cliponaxis=False,
+            hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
+            ))
+
+    fig_m.update_layout(barmode="group")
+    fig_m.update_yaxes(title="Rendimiento (%)", ticksuffix="%", showgrid=True)
+    _style_time_xaxis(fig_m, n_points=len(dfp), print_mode=print_mode)
+    _style_fig_for_mode(fig_m, print_mode=print_mode)
+    # Benchmark (composición) bajo la gráfica (producto)
+    rows_bm_prod = get_bench_ficha_rows(
+        alias_cdm=globals().get("ALIAS_CDM", ""),
+        nombre_corto_focus=globals().get("NOMBRE_CORTO_FOCUS"),
+        producto=str(producto),
+        modo=None,
+    )
+    footer_bm_prod = bench_ficha_to_markdown(rows_bm_prod, title="Benchmark (composición)")
+    render_print_block(" ", fig_m, print_mode=print_mode, break_after=True, footer_md=footer_bm_prod)
+
+
+
+    # -------- Acumulado (por año, 5y) --------
+    tmp = build_yearly_accum_series(df_hist_prod_5y, modo, y, m, n_years=5, producto=producto)
+    if isinstance(tmp, tuple) and len(tmp) == 2:
+        x_years, y_years = tmp
+    else:
+        x_years, y_years = [], []
+
+    if len(x_years) == 0:
+        st.caption("Sin histórico suficiente para acumulado anual.")
+        return
+
+    fig_a = go.Figure()
+    fig_a.add_trace(go.Bar(
+        x=x_years,
+        y=y_years,
+        name="Acumulado anual",
+        text=[f"{v:.1f}%" if (v is not None and not np.isnan(v)) else "" for v in y_years] if print_mode else None,
+        hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>",
+    ))
+
+    # benchmark anual por año (usa BENCH_YTD / BENCH_YTD_ANUAL)
+    if bench_pack is not None and not bench_pack.empty:
+        col_b = "BENCH_YTD_ANUAL" if modo == "Anualizado" else "BENCH_YTD"
+
+        bp = bench_pack.copy()
+        bp["FECHA"] = pd.to_datetime(bp["FECHA"], errors="coerce")
+        bp = bp.dropna(subset=["FECHA"]).copy()
+        bp["FECHA"] = (bp["FECHA"] + pd.offsets.MonthEnd(0)).dt.normalize()
+        bp["ANIO"] = bp["FECHA"].dt.year
+        bp["MES"] = bp["FECHA"].dt.month
+
+        y_bench = []
+        for yy in [int(x) for x in x_years]:
+            sub = bp[bp["ANIO"] == yy].copy()
+            if sub.empty or col_b not in sub.columns:
+                y_bench.append(np.nan)
+                continue
+            # preferir diciembre, si no, último mes disponible
+            if (sub["MES"] == 12).any():
+                row = sub[sub["MES"] == 12].sort_values("FECHA").iloc[-1]
+            else:
+                row = sub.sort_values("FECHA").iloc[-1]
+            v = pd.to_numeric(row.get(col_b), errors="coerce")
+            y_bench.append(float(v) * 100.0 if pd.notna(v) else np.nan)
+
+        if any(pd.notna(y_bench)):
+            # intenta traer nombre
+            bench_name2 = "Benchmark"  # leyenda corta; detalles en ficha
+            if "BENCH_LABEL" in bp.columns and bp["BENCH_LABEL"].notna().any():
+                bench_name2 = str(bp["BENCH_LABEL"].dropna().iloc[-1])
+            # Leyenda corta; detalles en ficha
+            bench_name2 = "Benchmark"
+
+            fig_a.add_trace(go.Bar(
+                x=x_years,
+                y=y_bench,
+                name=bench_name2,
+                text=[f"{v:.1f}%" if (v==v) else "" for v in y_bench],
+                hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>",
+            ))
+
+    fig_a.update_layout(barmode="group")
+    fig_a.update_yaxes(title="Rendimiento (%)", ticksuffix="%", showgrid=True)
+    _style_fig_for_mode(fig_a, print_mode=print_mode)
+    # Benchmark (composición) bajo la gráfica (producto)
+    rows_bm_prod_a = get_bench_ficha_rows(
+        alias_cdm=globals().get("ALIAS_CDM", ""),
+        nombre_corto_focus=globals().get("NOMBRE_CORTO_FOCUS"),
+        producto=str(producto),
+        modo=None,
+    )
+    footer_bm_prod_a = bench_ficha_to_markdown(rows_bm_prod_a, title="Benchmark (composición)")
+    render_print_block(" ", fig_a, print_mode=print_mode, break_after=True, footer_md=footer_bm_prod_a)
+
+# =========================
+#  BENCHMARKS: CACHE HELPERS
+# =========================
+@st.cache_data(show_spinner=False)
+def _bench_map_cached():
+    return load_bench_map(BENCH_MAP_FILE)
+
+@st.cache_data(show_spinner=False)
+def _bench_levels_cached(alias_cdm: str, nombre_corto: str, producto: str | None):
+    df_map = _bench_map_cached()
+    rows = get_bench_rows(df_map, alias_cdm=alias_cdm, nombre_corto=nombre_corto, producto=producto)
+    return build_benchmark_series(rows, BENCH_FILES)  # FECHA, BENCH (nivel)
+
+bench_map_df = load_bench_map(BENCH_MAP_FILE)
 # =========================
 #  RENDER SECCIONES
 # =========================
@@ -1747,20 +3038,20 @@ def render_resumen():
         sel = df_hist_rend[(df_hist_rend["ANIO"] == y) & (df_hist_rend["MES"] == m)]
         if not sel.empty:
             row = sel.iloc[0]
-            v_m = row["TASA_M_ANUAL"]
-            v_y = row["TASA_ACUM_ANUAL"]
+            v_m = row.get("TASA_M_ANUAL", np.nan)
+            v_y = row.get("TASA_ACUM_ANUAL", np.nan)
             if pd.notna(v_m):
-                kpi_rend_mes = f"{v_m * 100:.2f}%"
+                kpi_rend_mes = f"{float(v_m) * 100:.2f}%"
             if pd.notna(v_y):
-                kpi_rend_ytd = f"{v_y * 100:.2f}%"
+                kpi_rend_ytd = f"{float(v_y) * 100:.2f}%"
 
-    resumen_vals = {
+        # =========================
+    # KPIs: primero PORTAFOLIO TOTAL
+    # =========================
+    resumen_portafolio = {
         "Total Portafolio": f"${total_port:,.2f}",
         "# Contratos": f"{n_contratos:,}",
         "No. Estrategias": f"{n_productos:,}",
-        "Top Estrategia": top_prod_nom,
-        "Top %": f"{top_prod_pct:.2f}%",
-        "Top Monto": f"${top_prod_mnt:,.2f}",
         "Rend. mensual (anualizado)": kpi_rend_mes,
         "Rend. acum. año (anualizado)": kpi_rend_ytd,
     }
@@ -1768,14 +3059,33 @@ def render_resumen():
     st.markdown(
         '<div class="kpi-grid">' +
         "".join(
-            f'<div class="kpi-card"><div class="kpi-label">{k}</div>'
-            f'<div class="kpi-value">{v}</div></div>'
-            for k, v in resumen_vals.items()
+            f'<div class="kpi-card"><div class="kpi-label">{k}</div><div class="kpi-value">{v}</div></div>'
+            for k, v in resumen_portafolio.items()
         ) +
         '</div>',
         unsafe_allow_html=True
     )
-    st.markdown("<br>", unsafe_allow_html=True)
+
+    st.markdown("<hr/>", unsafe_allow_html=True)
+
+    # =========================
+    # KPIs: después TOP
+    # =========================
+    resumen_top = {
+        "Top Estrategia": top_prod_nom,
+        "Top %": f"{top_prod_pct:.2f}%",
+        "Top Monto": f"${top_prod_mnt:,.2f}",
+    }
+
+    st.markdown(
+        '<div class="kpi-grid">' +
+        "".join(
+            f'<div class="kpi-card"><div class="kpi-label">{k}</div><div class="kpi-value">{v}</div></div>'
+            for k, v in resumen_top.items()
+        ) +
+        '</div>',
+        unsafe_allow_html=True
+    )
 
     # PRINCIPALES HOLDINGS
     c1, c2 = st.columns((1, 1))
@@ -1820,18 +3130,13 @@ def render_resumen():
                     y=[pct],
                     name=lab,
                     text=[f"{pct:.2f}%"],
-                    textposition="outside",
                     hovertemplate="%{x}<br>" + lab + ": %{y:.2f}%<extra></extra>",
                 ))
 
             fig_hold.update_layout(
                 barmode="stack",
                 title="Principales holdings del portafolio (Top 5)",
-                yaxis=dict(
-                    title="% del portafolio",
-                    ticksuffix="%",
-                    range=[0, 100]
-                ),
+                yaxis=dict(title="% del portafolio", ticksuffix="%", range=[0, 100]),
                 xaxis=dict(title=""),
                 legend=LEGEND_RIGHT,
                 paper_bgcolor="rgba(0,0,0,0)",
@@ -1840,6 +3145,7 @@ def render_resumen():
                 height=CHART_H
             )
             fig_hold.update_traces(textfont_size=9, cliponaxis=False)
+            fig_hold = add_datapoints_to_fig(fig_hold, decimals=1)
             st.plotly_chart(fig_hold, use_container_width=True, config={"displayModeBar": False})
 
     with c2:
@@ -1859,93 +3165,111 @@ def render_resumen():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Rendimientos 12m
-    st.markdown("### Rendimiento bruto del contrato")
+    # ==========================================================
+    # Rendimientos 12m (contrato) + Benchmark PORTAFOLIO TOTAL
+    # ==========================================================
+    st.markdown("### Rendimiento bruto del contrato")    # Modo fijo (Portafolio/Deuda): Anualizado
+    modo = "Anualizado"
 
-    modo = st.radio(
-        "Tipo de rendimiento bruto mostrado",
-        ["Anualizado", "Efectivo"],
-        horizontal=True,
-        index=0,
-        key="modo_rend_resumen"
-    )
+    # --- siempre inicializa ---
+    bench_pack = None
+    nombre_corto_focus = str(st.session_state.get("NOMBRE_CORTO_FOCUS", "")).strip()
+
+    # PORTAFOLIO TOTAL => producto=None (según nuestra regla)
+    if nombre_corto_focus:
+        try:
+            bench_pack = build_bench_pack_from_map(
+                bench_map_df=bench_map_df,
+                alias_cdm=ALIAS_CDM,
+                nombre_corto=nombre_corto_focus,
+                producto=None,          # ✅ PORTAFOLIO TOTAL
+                bench_files=BENCH_FILES,
+            )
+            if bench_pack is not None and bench_pack.empty:
+                bench_pack = None
+        except Exception as e:
+            st.caption(f"Benchmarks (PORTAFOLIO TOTAL): no se pudo construir. ({e})")
+            bench_pack = None
 
     if df_hist_rend is None or df_hist_rend.empty:
         st.caption("No hay información de rendimientos brutos para los últimos 12 meses.")
+        return
+
+    dfh = df_hist_rend.sort_values(["ANIO", "MES"]).copy()
+
+    # FECHA month-end + LABEL
+    fechas_ini = pd.to_datetime(dict(year=dfh["ANIO"], month=dfh["MES"], day=1), errors="coerce")
+    dfh["LABEL"] = fechas_ini.dt.strftime("%b-%y")
+    dfh["FECHA"] = fechas_ini.dt.to_period("M").dt.to_timestamp("M")
+
+    # merge benchmark por FECHA month-end
+    if bench_pack is not None and not bench_pack.empty:
+        bp = bench_pack.copy()
+        bp["FECHA"] = pd.to_datetime(bp["FECHA"], errors="coerce")
+        bp = bp.dropna(subset=["FECHA"])
+        bp["FECHA"] = bp["FECHA"].dt.to_period("M").dt.to_timestamp("M")
+        bp = bp.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
+        dfh = dfh.merge(bp[["FECHA", "BENCH_M", "BENCH_YTD"]], on="FECHA", how="left")
+
+    # columnas Oracle
+    if modo == "Anualizado":
+        col_m = "TASA_M_ANUAL"
     else:
-        dfh = df_hist_rend.sort_values(["ANIO", "MES"]).copy()
-        fechas = pd.to_datetime(
-            dict(year=dfh["ANIO"], month=dfh["MES"], day=1),
-            errors="coerce"
-        )
-        dfh["LABEL"] = fechas.dt.strftime("%b-%y")
+        col_m = "TASA_M_EFEC"
 
-        if modo == "Anualizado":
-            col_m = "TASA_M_ANUAL"
-            col_a = "TASA_ACUM_ANUAL"
-        else:
-            col_m = "TASA_M_EFEC"
-            col_a = "TASA_ACUM_EFEC"
+    m_vals = (pd.to_numeric(dfh[col_m], errors="coerce") * 100.0).round(2)
+    x_labels = dfh["LABEL"].tolist()
 
-        m_vals = (dfh[col_m] * 100.0).round(2)
-        a_vals = (dfh[col_a] * 100.0).round(2)
-        x_labels = dfh["LABEL"].tolist()
+    # =========================
+    # Mensual (12m)
+    # =========================
+    d = _month_end_from_anio_mes(dfh, "ANIO", "MES", "FECHA")
+    d[col_m] = pd.to_numeric(d[col_m], errors="coerce")
+    d = d.dropna(subset=["FECHA", col_m]).sort_values("FECHA").copy()
 
-        fig_m = go.Figure()
-        fig_m.add_trace(go.Scatter(
-            x=x_labels,
-            y=m_vals,
-            mode="lines+markers+text",
-            name="Mensual",
-            text=[f"{v:.2f}%" if not pd.isna(v) else "" for v in m_vals],
-            textposition="top center",
-            hovertemplate="%{x}<br>Mensual: %{y:.2f}%<extra></extra>",
-        ))
-        fig_m.update_layout(
-            title="Rendimiento bruto mensual",
-            yaxis=dict(title="Rendimiento (%)"),
-            xaxis=dict(title="Mes", tickangle=0),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1.0
-            ),
-            margin=dict(l=10, r=10, t=60, b=40),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=BARH_H,
-        )
-        st.plotly_chart(fig_m, use_container_width=True, config={"displayModeBar": False})
+    fig_m = go.Figure()
 
-        fig_a = go.Figure()
-        fig_a.add_trace(go.Scatter(
-            x=x_labels,
-            y=a_vals,
-            mode="lines+markers+text",
-            name="Acumulado",
-            text=[f"{v:.2f}%" if not pd.isna(v) else "" for v in a_vals],
-            textposition="top center",
-            hovertemplate="%{x}<br>Acumulado: %{y:.2f}%<extra></extra>",
-        ))
-        fig_a.update_layout(
-            title="Rendimiento bruto acumulado",
-            yaxis=dict(title="Rendimiento (%)"),
-            xaxis=dict(title="Mes", tickangle=0),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1.0
-            ),
-            margin=dict(l=10, r=10, t=60, b=40),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=BARH_H,
-        )
-        st.plotly_chart(fig_a, use_container_width=True, config={"displayModeBar": False})
+    y_port = (d[col_m] * 100.0)
+    fig_m.add_trace(go.Bar(
+        x=d["FECHA"],
+        y=y_port,
+        name="Portafolio",
+        text=[f"{v:.1f}%" for v in y_port] if print_mode else None,  # ✅ sin decimales en impresión
+        hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
+    ))
+
+    if "BENCH_M" in d.columns:
+        bm = pd.to_numeric(d["BENCH_M"], errors="coerce")
+        if bm.notna().any():
+            bench_name = "Benchmark"
+            if "BENCH_LABEL" in d.columns and d["BENCH_LABEL"].notna().any():
+                bench_name = str(d["BENCH_LABEL"].dropna().iloc[-1])
+
+            fig_m.add_trace(go.Bar(
+                x=d["FECHA"],
+                y=(bm * 100.0),
+                name=bench_name,  # ✅ nombre real
+            cliponaxis=False,
+            hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
+            ))
+    fig_m.update_yaxes(title="Rendimiento (%)", ticksuffix="%", showgrid=True)
+
+    _style_time_xaxis(fig_m, n_points=len(d), print_mode=print_mode)
+    _style_fig_for_mode(fig_m, print_mode=print_mode)
+    # Benchmark (composición) bajo la gráfica
+    rows_bm_pf = get_bench_ficha_rows(
+        alias_cdm=ALIAS_CDM,
+        nombre_corto_focus=NOMBRE_CORTO_FOCUS,
+        producto=None,  # contrato / portafolio
+        modo=None,
+    )
+    footer_bm_pf = bench_ficha_to_markdown(rows_bm_pf, title="Benchmark (composición)")
+    render_print_block(" ", fig_m, print_mode=print_mode, break_after=True, footer_md=footer_bm_pf)
+
+    # =========================
+    # Acumulado por año (últimos 5 años)
+    # =========================
+    x_years, y_years = build_yearly_accum_series(df_hist_rend_5y, modo, y, m, n_years=5)
 
 def render_allocation_general():
     st.subheader("Portafolio")
@@ -1985,8 +3309,9 @@ def render_allocation_detalle():
             st.info("Selecciona al menos un producto Deuda.")
         else:
             det_d = det_d.groupby("PRODUCTO")["Monto"].sum().reset_index().sort_values("Monto", ascending=False)
-            st.plotly_chart(donut_figure(det_d["PRODUCTO"], det_d["Monto"], "Deuda — Estrategias seleccionadas"),
-                            use_container_width=True, config={"displayModeBar": False})
+            fig_donut = donut_figure(det_d["PRODUCTO"], det_d["Monto"], "Deuda — Estrategias seleccionadas")
+            st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+
             vista = det_d.copy()
             vista["%"] = (vista["Monto"]/vista["Monto"].sum()*100).round(2)
             vista["Monto"] = vista["Monto"].map(lambda x: f"${x:,.2f}")
@@ -2003,8 +3328,9 @@ def render_allocation_detalle():
             st.info("Selecciona al menos un producto RV.")
         else:
             det_r = det_r.groupby("PRODUCTO")["Monto"].sum().reset_index().sort_values("Monto", ascending=False)
-            st.plotly_chart(donut_figure(det_r["PRODUCTO"], det_r["Monto"], "Capitales — Estrategias seleccionadas"),
-                            use_container_width=True, config={"displayModeBar": False})
+            fig_donut = donut_figure(det_r["PRODUCTO"], det_r["Monto"], "Capitales — Estrategias seleccionadas")
+            st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+
             vista = det_r.copy()
             vista["%"] = (vista["Monto"]/vista["Monto"].sum()*100).round(2)
             vista["Monto"] = vista["Monto"].map(lambda x: f"${x:,.2f}")
@@ -2120,7 +3446,6 @@ def render_deuda_riesgo(df_final):
             mode="lines+markers+text",
             name="Duración (días)",
             text=text_vals,
-            textposition="top center",
             hovertemplate="%{x|%Y-%m}: %{y:.0f} días<extra></extra>"
         ))
         fig.update_layout(
@@ -2131,6 +3456,7 @@ def render_deuda_riesgo(df_final):
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=220, t=42, b=6), height=BARH_H
         )
+        fig = add_datapoints_to_fig(fig, decimals=1)
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     else:
         st.caption("No hay histórico de duración disponible.")
@@ -2147,6 +3473,7 @@ def render_deuda_historico_trimestral():
             idx = list(pvt.index)
             tickvals = idx[::2] if len(idx) > 2 else idx
             fig = area100_from_pivot(pvt, "Tipo de Papel", tickvals=tickvals)
+            fig = add_datapoints_to_fig(fig, decimals=1)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     with c2:
         if hist_deuda_instr.empty:
@@ -2157,6 +3484,7 @@ def render_deuda_historico_trimestral():
             idx2 = list(pvt2.index)
             tickvals2 = idx2[::2] if len(idx2) > 2 else idx2
             fig2 = area100_from_pivot(pvt2, "Tipo de Instrumento", tickvals=tickvals2)
+            fig2 = add_datapoints_to_fig(fig2, decimals=1)
             st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
 
 def render_deuda_tabla(df_final):
@@ -2252,17 +3580,45 @@ def render_deuda_rendimientos_por_producto():
     if df_hist_rend_prod is None or df_hist_rend_prod.empty:
         st.info("Sin rendimientos por producto disponibles.")
         return
+
     prod_act = df_aa_producto[["PRODUCTO","ACTIVO"]].drop_duplicates()
-    df = df_hist_rend_prod.merge(prod_act, left_on="PRODUCTO", right_on="PRODUCTO", how="left")
+    df = df_hist_rend_prod.merge(prod_act, on="PRODUCTO", how="left")
     df = df[df["ACTIVO"] == "Deuda"]
     if df.empty:
         st.info("No hay productos de deuda con rendimientos.")
         return
-    productos = sorted(df["PRODUCTO"].unique().tolist())
-    prod_sel = st.selectbox("Estrategia Deuda", options=productos, index=0)
-    modo = st.radio("Tipo de rendimiento", ["Anualizado","Efectivo"], horizontal=True, key="rend_deuda_prod")
-    plot_rend_producto_series(df, prod_sel, modo, "Rendimientos brutos")
 
+    productos = sorted(df["PRODUCTO"].unique().tolist())
+    prod_sel = st.selectbox("Estrategia Deuda", options=productos, index=0)    # Modo fijo (Deuda): Anualizado
+    modo = "Anualizado"
+
+    # ✅ contrato foco para buscar benchmarks
+    nombre_corto_focus = str(st.session_state.get("NOMBRE_CORTO_FOCUS", "")).strip()
+
+    bench_pack = None
+    if nombre_corto_focus:
+        try:
+            # producto != portafolio total => benchmarks de producto
+            bench_pack = build_bench_pack_from_map(
+                bench_map_df=bench_map_df,
+                alias_cdm=ALIAS_CDM,
+                nombre_corto=nombre_corto_focus,
+                producto=prod_sel,          # ✅ benchmarks ligados al producto
+                bench_files=BENCH_FILES,
+            )
+            if bench_pack is not None and bench_pack.empty:
+                bench_pack = None
+        except Exception as e:
+            st.caption(f"Benchmarks (producto): no se pudo construir benchmark. ({e})")
+            bench_pack = None
+
+    plot_rend_producto_series(df, df_hist_rend_prod_5y, prod_sel, modo, bench_pack=bench_pack)
+    try:
+        ficha_df = get_bench_ficha_rows(ALIAS_CDM, NOMBRE_CORTO_FOCUS, prod_sel, modo)
+        render_benchmark_ficha(ficha_df, modo=modo)
+    except Exception:
+        pass
+    
 def render_rv_resumen():
     st.subheader("Distribución")
     if rv_enriq_base.empty:
@@ -2271,8 +3627,8 @@ def render_rv_resumen():
     c1, c2 = st.columns((1,1))
     with c1:
         sec = rv_enriq_base.groupby("sector")["MONTO"].sum().reset_index().sort_values("MONTO", ascending=False)
-        st.plotly_chart(donut_figure(sec["sector"], sec["MONTO"], "Distribución por Sector"),
-                        use_container_width=True, config={"displayModeBar": False})
+        fig_sec = donut_figure(sec["sector"], sec["MONTO"], "Distribución por Sector")
+        st.plotly_chart(fig_sec, use_container_width=True, config={"displayModeBar": False})
         sec_tab = sec.copy()
         sec_tab["%"] = (sec_tab["MONTO"]/sec_tab["MONTO"].sum()*100).round(2)
         sec_tab["MONTO"] = sec_tab["MONTO"].map(lambda x: f"${x:,.2f}")
@@ -2285,8 +3641,8 @@ def render_rv_resumen():
             st.dataframe(sec_tab, hide_index=True, use_container_width=True)
     with c2:
         ind = rv_enriq_base.groupby("industry")["MONTO"].sum().reset_index().sort_values("MONTO", ascending=False)
-        st.plotly_chart(donut_figure(ind["industry"], ind["MONTO"], "Distribución por Industria"),
-                        use_container_width=True, config={"displayModeBar": False})
+        fig_industry = donut_figure(ind["industry"], ind["MONTO"], "Distribución por Industria")
+        st.plotly_chart(fig_industry, use_container_width=True, config={"displayModeBar": False})
         ind_tab = ind.copy()
         ind_tab["%"] = (ind_tab["MONTO"]/ind_tab["MONTO"].sum()*100).round(2)
         ind_tab["MONTO"] = ind_tab["MONTO"].map(lambda x: f"${x:,.2f}")
@@ -2426,8 +3782,12 @@ def render_rv_evolucion():
     )
     c1, c2 = st.columns(2)
     with c1:
+#         fig = add_datapoints_to_fig(fig, decimals=1)
+        fig_sec = add_datapoints_to_fig(fig_sec, decimals=1)
         st.plotly_chart(fig_sec, use_container_width=True, config={"displayModeBar": False})
     with c2:
+#         fig = add_datapoints_to_fig(fig, decimals=1)
+        fig_ind = add_datapoints_to_fig(fig_ind, decimals=1)
         st.plotly_chart(fig_ind, use_container_width=True, config={"displayModeBar": False})
 
 def render_rv_rendimientos_por_producto():
@@ -2435,16 +3795,42 @@ def render_rv_rendimientos_por_producto():
     if df_hist_rend_prod is None or df_hist_rend_prod.empty:
         st.info("Sin rendimientos por producto disponibles.")
         return
+
     prod_act = df_aa_producto[["PRODUCTO","ACTIVO"]].drop_duplicates()
-    df = df_hist_rend_prod.merge(prod_act, left_on="PRODUCTO", right_on="PRODUCTO", how="left")
+    df = df_hist_rend_prod.merge(prod_act, on="PRODUCTO", how="left")
     df = df[df["ACTIVO"] == "Renta Variable"]
     if df.empty:
         st.info("No hay productos de renta variable con rendimientos.")
         return
+
     productos = sorted(df["PRODUCTO"].unique().tolist())
-    prod_sel = st.selectbox("Estrategia RV", options=productos, index=0)
-    modo = st.radio("Tipo de rendimiento", ["Anualizado","Efectivo"], horizontal=True, key="rend_rv_prod")
-    plot_rend_producto_series(df, prod_sel, modo, "Rendimientos brutos")
+    prod_sel = st.selectbox("Estrategia RV", options=productos, index=0)    # Modo fijo (Renta Variable): Efectivo
+    modo = "Efectivo"
+
+    nombre_corto_focus = str(st.session_state.get("NOMBRE_CORTO_FOCUS", "")).strip()
+
+    bench_pack = None
+    if nombre_corto_focus:
+        try:
+            bench_pack = build_bench_pack_from_map(
+                bench_map_df=bench_map_df,
+                alias_cdm=ALIAS_CDM,
+                nombre_corto=nombre_corto_focus,
+                producto=prod_sel,          # ✅ benchmarks ligados al producto
+                bench_files=BENCH_FILES,
+            )
+            if bench_pack is not None and bench_pack.empty:
+                bench_pack = None
+        except Exception as e:
+            st.caption(f"Benchmarks (producto): no se pudo construir benchmark. ({e})")
+            bench_pack = None
+
+    plot_rend_producto_series(df, df_hist_rend_prod_5y, prod_sel, modo, bench_pack=bench_pack)
+    try:
+        ficha_df = get_bench_ficha_rows(ALIAS_CDM, NOMBRE_CORTO_FOCUS, prod_sel, modo)
+        render_benchmark_ficha(ficha_df, modo=modo)
+    except Exception:
+        pass
 
 # =========================
 #  TABS
