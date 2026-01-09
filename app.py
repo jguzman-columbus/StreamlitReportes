@@ -443,29 +443,135 @@ def _month_end_from_anio_mes(df: pd.DataFrame, anio_col="ANIO", mes_col="MES", o
     d[out_col] = (dt + pd.offsets.MonthEnd(0)).dt.normalize()
     return d
 
+def _get_cutoff_month_end() -> pd.Timestamp:
+    """Cierre de mes según parámetros aplicados del sidebar (Y_APPLIED/M_APPLIED)."""
+    hoy = date.today()
+    y = int(st.session_state.get("Y_APPLIED", hoy.year))
+    m = int(st.session_state.get("M_APPLIED", hoy.month))
+    return (pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)).normalize()
+
+def _fix_month_end_shift_if_needed(
+    d: pd.DataFrame,
+    end_ref: pd.Timestamp,
+    date_col: str = "FECHA"
+) -> pd.DataFrame:
+    """
+    Si la serie mensual viene 1 mes adelantada (max(FECHA) > end_ref ~ 1 mes),
+    corrige restando 1 cierre de mes a toda la serie.
+    """
+    if d is None or d.empty or date_col not in d.columns:
+        return d
+
+    out = d.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out = out.dropna(subset=[date_col])
+    if out.empty:
+        return d
+
+    max_fecha = out[date_col].max()
+    end_ref = pd.to_datetime(end_ref, errors="coerce")
+
+    if pd.isna(end_ref):
+        return d
+
+    # si viene 1 mes adelantado (típico: 28-31 días)
+    delta_days = (max_fecha - end_ref).days
+    if delta_days >= 20 and delta_days <= 40:
+        out[date_col] = (out[date_col] - pd.offsets.MonthEnd(1)).dt.normalize()
+        return out
+
+    return d
+
+def _month_end_spine(end_ref: pd.Timestamp, n: int = 12) -> pd.DatetimeIndex:
+    """Espina de cierres de mes (month-end) que termina en `end_ref` (incluye `end_ref`)."""
+    end_ref = pd.to_datetime(end_ref, errors="coerce")
+    if pd.isna(end_ref):
+        end_ref = (pd.Timestamp.today() + pd.offsets.MonthEnd(0)).normalize()
+    end_ref = (end_ref + pd.offsets.MonthEnd(0)).normalize()
+    return pd.date_range(end=end_ref, periods=int(n), freq="M").normalize()
+
+
+def _reindex_to_month_spine(df: pd.DataFrame, spine: pd.DatetimeIndex, date_col: str = "FECHA") -> pd.DataFrame:
+    """Normaliza `date_col` a cierre de mes y reindexa a `spine` (mantiene columnas)."""
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out = out.dropna(subset=[date_col]).copy()
+    out[date_col] = (out[date_col] + pd.offsets.MonthEnd(0)).dt.normalize()
+    out = out.sort_values(date_col)
+    out = out.drop_duplicates(subset=[date_col], keep="last")
+    out = out.set_index(date_col).reindex(spine).reset_index().rename(columns={"index": date_col})
+    return out
+
+
+def _clip_monthly_df(df: pd.DataFrame, end_ref: pd.Timestamp, date_col: str = "FECHA") -> pd.DataFrame:
+    """Recorta a `<= end_ref` (cierre de mes) y normaliza fecha."""
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out = out.dropna(subset=[date_col]).copy()
+    end_ref = (pd.to_datetime(end_ref) + pd.offsets.MonthEnd(0)).normalize()
+    out[date_col] = (out[date_col] + pd.offsets.MonthEnd(0)).dt.normalize()
+    return out[out[date_col] <= end_ref].copy()
 
 def _style_time_xaxis(fig: go.Figure, n_points: int, print_mode: bool):
-    # Rotación cuando hay muchos puntos
-    angle = -45 if n_points > 8 else 0
-    if print_mode and n_points > 6:
-        angle = -45
+    """
+    FIX definitivo para gráficas mensuales:
+    - Bloquea ticks exactamente a los meses existentes en los datos
+    - Bloquea el rango para que Plotly NO muestre el mes siguiente (ej. agosto)
+    """
 
-    # Menos ticks cuando se amontona (más agresivo en impresión)
-    nticks = 6 if n_points > 12 else max(4, n_points)
-    if print_mode:
-        nticks = 5 if n_points > 10 else max(4, n_points)
+    # rotación
+    angle = 45 if (n_points > 8 or (print_mode and n_points > 6)) else 0
+
+    # --- recolecta todos los X de todos los traces ---
+    xs = []
+    for tr in fig.data:
+        try:
+            if getattr(tr, "x", None) is not None:
+                xs.extend(list(tr.x))
+        except Exception:
+            pass
+
+    xdt = pd.to_datetime(pd.Series(xs), errors="coerce").dropna()
+    if xdt.empty:
+        # fallback
+        fig.update_xaxes(
+            tickformat="%b-%Y",
+            tickangle=angle,
+            tickmode="auto",
+            nticks=6,
+            showgrid=True,
+            ticks="outside",
+            title=None
+        )
+        return
+
+    # normaliza a cierre de mes y ordena
+    xuniq = (
+        pd.to_datetime(pd.Index(xdt.unique()))
+        .to_period("M").to_timestamp("M")
+        .sort_values()
+    )
+
+    tickvals = xuniq.tolist()
+    ticktext = [d.strftime("%b-%y") for d in xuniq]
+
+    # rango EXACTO (pequeño padding visual para que no corte)
+    pad_days = 12 if n_points <= 10 else 16
+    x_min = xuniq.min() - pd.Timedelta(days=pad_days)
+    x_max = xuniq.max() + pd.Timedelta(days=pad_days)
+
 
     fig.update_xaxes(
-        tickformat="%b-%Y",
+        type="date",
+        tickmode="array",
+        tickvals=tickvals,
+        ticktext=ticktext,
+        range=[x_min, x_max],
         tickangle=angle,
-        tickmode="auto",
-        nticks=nticks,
         showgrid=True,
         ticks="outside",
         title=None
     )
-
-
 
 def _style_fig_for_mode(fig: go.Figure, print_mode: bool):
     """Aplica estilos base y etiquetas de datos (1 decimal) a las gráficas."""
@@ -492,6 +598,53 @@ def _style_fig_for_mode(fig: go.Figure, print_mode: bool):
             texttemplate="%{y:.1f}%",
             hovertemplate="%{y:.2f}%<extra></extra>",
         )
+    except Exception:
+        pass
+
+        # ✅ Headroom para que no se corte el texto fuera de las barras
+    try:
+        # si el usuario ya fijó un range, no lo tocamos
+        yr = getattr(fig.layout.yaxis, "range", None)
+        if not yr:
+            y_vals = []
+            for tr in fig.data:
+                if getattr(tr, "type", None) == "bar" and getattr(tr, "y", None) is not None:
+                    y_vals.extend(list(tr.y))
+
+            y_ser = pd.to_numeric(pd.Series(y_vals), errors="coerce").dropna()
+            if not y_ser.empty:
+                ymin = float(y_ser.min())
+                ymax = float(y_ser.max())
+
+                # padding arriba (10%) + un mínimo visual
+                pad = max(abs(ymax) * 0.10, 0.5)
+
+                if ymin >= 0:
+                    fig.update_yaxes(range=[0, ymax + pad])
+                else:
+                    fig.update_yaxes(range=[ymin - pad, ymax + pad])
+    except Exception:
+        pass
+
+        # ✅ HEADROOM: evita que se corte el texto cuando la barra llega arriba
+    try:
+        y_vals = []
+        for tr in fig.data:
+            if getattr(tr, "type", None) == "bar" and getattr(tr, "y", None) is not None:
+                y_vals.extend(list(tr.y))
+        y_ser = pd.to_numeric(pd.Series(y_vals), errors="coerce").dropna()
+
+        if not y_ser.empty:
+            ymin = float(y_ser.min())
+            ymax = float(y_ser.max())
+
+            # padding (8% arriba). Si todo es positivo, ancla en 0.
+            pad = (abs(ymax) * 0.08) if ymax != 0 else 1.0
+
+            if ymin >= 0:
+                fig.update_yaxes(range=[0, ymax + pad])
+            else:
+                fig.update_yaxes(range=[ymin - pad, ymax + pad])
     except Exception:
         pass
 
@@ -1044,15 +1197,6 @@ def build_bench_pack_from_map(
     rows = dfm[(dfm["ALIAS_CDM"] == a) & (dfm["NOMBRE_CORTO"] == nc)].copy()
     if rows.empty:
         return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
-    
-    bench_label = "Benchmark"  # leyenda corta; detalles en la ficha abajo
-
-    if "BENCHMARK_LABEL" in rows.columns:
-        labs = rows["BENCHMARK_LABEL"].astype(str).str.strip()
-        labs = [x for x in labs.tolist() if x and x.lower() != "nan"]
-    else:
-        labs = []
-        bench_label = "Benchmark"  # leyenda corta; detalles en la ficha abajo
 
     # 2) filtra por producto según regla
     if producto is None:
@@ -1063,6 +1207,74 @@ def build_bench_pack_from_map(
         rows["__PROD_U__"] = rows["PRODUCTO"].astype(str).str.strip().str.upper()
         rows = rows[rows["__PROD_U__"] == prod_u].copy()
         rows = rows.drop(columns=["__PROD_U__"], errors="ignore")
+
+    # ===============================
+    # BENCH_LABEL (post-filtro producto)
+    # ===============================
+    def _compact_label(labels, max_len=42):
+        labels = [str(x).strip() for x in labels if str(x).strip().lower() != "nan"]
+        labels = list(dict.fromkeys(labels))  # unique, mantiene orden
+        if not labels:
+            return "Benchmark"
+        if len(labels) == 1:
+            return labels[0]
+        txt = " + ".join(labels)
+        if len(txt) <= max_len:
+            return txt
+        return f"{labels[0]} + {len(labels)-1} más"
+
+    if "BENCHMARK_LABEL" in rows.columns:
+        labs = rows["BENCHMARK_LABEL"].astype(str).tolist()
+    elif "COL_NAME" in rows.columns:
+        labs = rows["COL_NAME"].astype(str).tolist()
+    else:
+        labs = []
+
+    bench_label = _compact_label(labs)
+
+    # ===============================
+    # BENCH_LABEL para leyenda (post-filtro por producto)
+    # - Si hay varios benchmarks: mostrar TODOS con su peso
+    # ===============================
+    def _build_label_with_weights(rows_: pd.DataFrame) -> str:
+        if rows_ is None or rows_.empty:
+            return "Benchmark"
+
+        # label base
+        if "BENCHMARK_LABEL" in rows_.columns:
+            lab_ser = rows_["BENCHMARK_LABEL"].astype(str).str.strip()
+        elif "COL_NAME" in rows_.columns:
+            lab_ser = rows_["COL_NAME"].astype(str).str.strip()
+        else:
+            lab_ser = pd.Series(["Benchmark"] * len(rows_))
+
+        # pesos
+        if "PESO" in rows_.columns:
+            w = pd.to_numeric(rows_["PESO"], errors="coerce")
+        else:
+            w = pd.Series([np.nan] * len(rows_))
+
+        tmp = pd.DataFrame({"lab": lab_ser, "w": w})
+        tmp = tmp[tmp["lab"].str.lower().ne("nan") & tmp["lab"].str.len().gt(0)].copy()
+
+        if tmp.empty:
+            return "Benchmark"
+
+        # orden por peso desc (si existe), si no, mantiene orden original
+        if tmp["w"].notna().any():
+            tmp = tmp.sort_values("w", ascending=False)
+
+        parts = []
+        for _, r in tmp.iterrows():
+            if pd.notna(r["w"]):
+                parts.append(f'{r["lab"]} ({r["w"]:.0f}%)')
+            else:
+                parts.append(f'{r["lab"]}')
+
+        # separador legible en leyenda (sin "+ n más")
+        return " · ".join(parts)
+
+    bench_label = _build_label_with_weights(rows)
 
     if rows.empty:
         return pd.DataFrame(columns=["FECHA","ANIO","MES","BENCH_M","BENCH_YTD","BENCH_M_ANUAL","BENCH_YTD_ANUAL"])
@@ -1112,17 +1324,9 @@ def build_bench_pack_from_map(
     out["FECHA"] = out["FECHA"].dt.to_period("M").dt.to_timestamp("M")
     out = out.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
     out["BENCH_LABEL"] = bench_label
-
+    
     return out
 
-
-
-# =========================
-#  BENCHMARKS: LEVELS -> RETURNS (MONTH-END)
-# =========================
-# =========================
-#  BENCHMARKS · FICHA + KPI VS BENCH
-# =========================
 def get_bench_ficha_rows(alias_cdm: str, nombre_corto_focus: str | None, producto: str | None, modo: str | None = None) -> pd.DataFrame:
     """Devuelve las filas del Mapa_Benchmarks para construir la ficha del benchmark.
     - Para contrato (portafolio): producto=None
@@ -1575,6 +1779,49 @@ def _to_dec(x):
         return v if 0 <= v <= 1 else v/100.0
     except:
         return np.nan
+
+def build_yearly_accum_series_from_bench_pack(
+    bench_pack: pd.DataFrame,
+    y_ref: int,
+    m_ref: int,
+    n_years: int = 5
+):
+    """
+    Devuelve (x_labels, y_vals) usando BENCH_YTD del bench_pack.
+    - Para cada año, toma el último BENCH_YTD disponible <= m_ref (o diciembre si m_ref=12).
+    """
+    if bench_pack is None or bench_pack.empty:
+        return [], []
+
+    bp = bench_pack.copy()
+    bp["FECHA"] = pd.to_datetime(bp["FECHA"], errors="coerce")
+    bp = bp.dropna(subset=["FECHA"])
+    if bp.empty:
+        return [], []
+
+    bp["ANIO"] = bp["FECHA"].dt.year
+    bp["MES"] = bp["FECHA"].dt.month
+
+    years = list(range(y_ref - (n_years - 1), y_ref + 1))
+    x_labels, y_vals = [], []
+
+    for yy in years:
+        sub = bp[bp["ANIO"] == yy].copy()
+        if sub.empty:
+            x_labels.append(str(yy))
+            y_vals.append(np.nan)
+            continue
+
+        # hasta el mes de corte si existe; si no, usa el último mes disponible
+        sub = sub[sub["MES"] <= m_ref] if (sub["MES"] <= m_ref).any() else sub
+
+        row = sub.sort_values(["MES", "FECHA"]).iloc[-1]
+        v = row.get("BENCH_YTD")
+
+        x_labels.append(str(yy))
+        y_vals.append(float(v) * 100.0 if pd.notna(v) else np.nan)
+
+    return x_labels, y_vals
 
 def build_yearly_accum_series(
     df: pd.DataFrame,
@@ -2073,7 +2320,8 @@ def build_query_base_unfiltered(alias: str, fecha: str, contratos_key: tuple[int
     return sql, params
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def aa_hist_ultimo_5_anios(alias: str, contratos_key: tuple[int, ...] | None = None):
+def aa_hist_ultimo_5_anios(alias: str, cutoff_next: pd.Timestamp,
+                           contratos_key: tuple[int, ...] | None = None):
     filtro_contratos, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_aa_hist")
 
     SQL = f"""
@@ -2089,13 +2337,16 @@ def aa_hist_ultimo_5_anios(alias: str, contratos_key: tuple[int, ...] | None = N
       LEFT JOIN SIAPII.V_M_PRODUCTO p ON p.ID_PRODUCTO = e.ID_PRODUCTO
       WHERE c.ALIAS_CDM = :alias
         {filtro_contratos}
-        AND e.FECHA_ESTADISTICA >= ADD_MONTHS(TRUNC(SYSDATE,'YYYY'), -12*5)
+        AND e.FECHA_ESTADISTICA <  TO_DATE(:cutoff_next,'YYYY-MM-DD')
+        AND e.FECHA_ESTADISTICA >= ADD_MONTHS(TRUNC(TO_DATE(:cutoff_next,'YYYY-MM-DD'),'YYYY'), -12*5)
+
       GROUP BY EXTRACT(YEAR FROM TRUNC(e.FECHA_ESTADISTICA)), {CASE_ACTIVO}, COALESCE(p.DESCRIPCION, 'SIN_DESCRIPCION')
     )
     SELECT * FROM A
     """
-    params = {"alias": alias}
+    params = {"alias": alias, "cutoff_next": pd.to_datetime(cutoff_next).strftime("%Y-%m-%d")}
     params.update(extra_params)
+
     df = run_sql(SQL, params)
     if df.empty:
         return (pd.DataFrame(columns=["ANIO","ACTIVO","MONTO","Pct"]),
@@ -2149,62 +2400,114 @@ def where_filters_for_his(contratos_key: tuple[int, ...] | None = None):
     return base_sql + filtro + " )", params
 
 @st.cache_data(ttl=1200, show_spinner=True)
-def query_snapshot_deuda(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Timestamp,
-                         contratos_key: tuple[int, ...] | None = None) -> pd.DataFrame:
+def query_snapshot_deuda(
+    alias: str,
+    f_ini: pd.Timestamp,
+    f_fin_next: pd.Timestamp,
+    contratos_key: tuple[int, ...] | None = None
+) -> pd.DataFrame:
     params, DATE_EXPR = build_snapshot_params(alias, f_ini, f_fin_next)
-    filtro_fc, params_fc = build_contrato_filter_sql(contratos_key, "c1.ID_CLIENTE", "cid_fc")
-    where_exists, params_h = where_filters_for_his(contratos_key)
 
+    # Filtro de contratos sobre V_M_CONTRATO_CDM
+    filtro_fc, params_fc = build_contrato_filter_sql(contratos_key, "c1.ID_CLIENTE", "cid_fc")
     params.update(params_fc)
-    params.update(params_h)
 
     SQL_SNAPSHOT = f"""
-WITH FECHA_C AS (
-  SELECT MAX(TRUNC(h1.REGISTRO_CONTROL)) AS FECHA_CORTE
+WITH
+CLIENTES AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT c1.ID_CLIENTE
+  FROM SIAPII.V_M_CONTRATO_CDM c1
+  WHERE c1.ALIAS_CDM = :alias_up
+  {filtro_fc}
+),
+
+/* 1) fecha de corte: MAX(REGISTRO_CONTROL) para esos clientes y rango */
+FECHA_C AS (
+  SELECT /*+ MATERIALIZE */
+    MAX(h1.REGISTRO_CONTROL)        AS FECHA_CORTE_TS,
+    TRUNC(MAX(h1.REGISTRO_CONTROL)) AS FECHA_CORTE_DAY
   FROM SIAPII.V_HIS_POSICION_CLIENTE h1
-  WHERE TRUNC(h1.REGISTRO_CONTROL) >= TO_DATE(:f_ini_dt,'YYYY-MM-DD')
-    AND TRUNC(h1.REGISTRO_CONTROL) <  TO_DATE(:f_fin_dt,'YYYY-MM-DD')
-    AND EXISTS (
-        SELECT 1
-        FROM SIAPII.V_M_CONTRATO_CDM c1
-        WHERE c1.ALIAS_CDM = :alias_up
-          AND c1.ID_CLIENTE = h1.ID_CLIENTE
-          {filtro_fc}
-    )
+  JOIN CLIENTES c ON c.ID_CLIENTE = h1.ID_CLIENTE
+  WHERE h1.REGISTRO_CONTROL >= TO_DATE(:f_ini_dt,'YYYY-MM-DD')
+    AND h1.REGISTRO_CONTROL <  TO_DATE(:f_fin_dt,'YYYY-MM-DD')
 ),
+
+/* 2) snapshot del día de corte: TRAER SOLO COLUMNAS NECESARIAS */
 H_CORTE AS (
-  SELECT h.* FROM SIAPII.V_HIS_POSICION_CLIENTE h
-  JOIN FECHA_C fc ON TRUNC(h.REGISTRO_CONTROL) = fc.FECHA_CORTE
-  {where_exists}
+  SELECT /*+ MATERIALIZE */
+    h.ID_CLIENTE,
+    h.ID_PRODUCTO,
+    h.ID_EMISORA,
+    h.CALIFICACION_HOMOLOGADA,
+    h.CALIFICACION_S_P,
+    h.CALIFICACION_MDYS,
+    h.CALIFICACION_HRRATING,
+    h.CALIFICACION_FITCH,
+    h.EMIS_TASA,
+    h.VALOR_NOMINAL,
+    h.VALOR_REAL,
+    NVL(h.PLAZO_REPORTO,0) AS PLAZO_REPORTO,
+    h.REGISTRO_CONTROL
+  FROM SIAPII.V_HIS_POSICION_CLIENTE h
+  JOIN CLIENTES c ON c.ID_CLIENTE = h.ID_CLIENTE
+  CROSS JOIN FECHA_C fc
+  WHERE h.REGISTRO_CONTROL >= fc.FECHA_CORTE_DAY
+    AND h.REGISTRO_CONTROL <  fc.FECHA_CORTE_DAY + 1
 ),
-VTR_NORM AS (
-  SELECT r.ID_TASA_REFERENCIA, r.TASA_REFERENCIA, r.TASA, {DATE_EXPR} AS FECHA_TRUNC
+
+/* 3) Tasas referencia: FILTRAR DESDE EL ORIGEN por ids_csv */
+VTR_BASE AS (
+  SELECT
+    r.ID_TASA_REFERENCIA,
+    r.TASA_REFERENCIA,
+    r.TASA,
+    {DATE_EXPR} AS FECHA_TRUNC
   FROM SIAPII.V_TASAS_REFERENCIA r
+  WHERE r.ID_TASA_REFERENCIA IN ({ids_csv})
 ),
+
 VTR_EXACT AS (
   SELECT v.ID_TASA_REFERENCIA, v.TASA, v.TASA_REFERENCIA
-  FROM VTR_NORM v CROSS JOIN FECHA_C fc
-  WHERE v.FECHA_TRUNC = fc.FECHA_CORTE
+  FROM VTR_BASE v
+  CROSS JOIN FECHA_C fc
+  WHERE v.FECHA_TRUNC = fc.FECHA_CORTE_DAY
 ),
+
 VTR_FALL AS (
-  SELECT x.ID_TASA_REFERENCIA, x.TASA, x.TASA_REFERENCIA FROM (
-    SELECT v.ID_TASA_REFERENCIA, v.TASA, v.TASA_REFERENCIA, v.FECHA_TRUNC,
-           ROW_NUMBER() OVER (PARTITION BY v.ID_TASA_REFERENCIA ORDER BY v.FECHA_TRUNC DESC) AS RN
-    FROM VTR_NORM v CROSS JOIN FECHA_C fc
-    WHERE v.ID_TASA_REFERENCIA IN ({ids_csv})
-      AND v.FECHA_TRUNC IS NOT NULL AND v.FECHA_TRUNC <= fc.FECHA_CORTE
-  ) x WHERE x.RN = 1
+  SELECT x.ID_TASA_REFERENCIA, x.TASA, x.TASA_REFERENCIA
+  FROM (
+    SELECT
+      v.ID_TASA_REFERENCIA,
+      v.TASA,
+      v.TASA_REFERENCIA,
+      v.FECHA_TRUNC,
+      ROW_NUMBER() OVER (
+        PARTITION BY v.ID_TASA_REFERENCIA
+        ORDER BY v.FECHA_TRUNC DESC
+      ) AS RN
+    FROM VTR_BASE v
+    CROSS JOIN FECHA_C fc
+    WHERE v.FECHA_TRUNC IS NOT NULL
+      AND v.FECHA_TRUNC <= fc.FECHA_CORTE_DAY
+  ) x
+  WHERE x.RN = 1
 ),
+
 VTR_REF AS (
   SELECT e.ID_TASA_REFERENCIA, e.TASA, e.TASA_REFERENCIA
   FROM VTR_EXACT e
   UNION ALL
   SELECT f.ID_TASA_REFERENCIA, f.TASA, f.TASA_REFERENCIA
   FROM VTR_FALL f
-  WHERE NOT EXISTS (SELECT 1 FROM VTR_EXACT e WHERE e.ID_TASA_REFERENCIA = f.ID_TASA_REFERENCIA)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM VTR_EXACT e
+    WHERE e.ID_TASA_REFERENCIA = f.ID_TASA_REFERENCIA
+  )
 )
+
 SELECT
-    h.ID_PRODUCTO, e.ID_EMISORA,
+    h.ID_PRODUCTO,
+    e.ID_EMISORA,
     MAX(e.NOMBRE_EMISORA)           AS NOMBRE_EMISORA,
     MAX(e.SERIE)                    AS SERIE,
     MAX(e.TIPO_PAPEL)               AS TIPO_PAPEL,
@@ -2221,8 +2524,9 @@ SELECT
     MAX(h.EMIS_TASA)                AS EMIS_TASA,
     SUM(h.VALOR_NOMINAL)            AS VALOR_NOMINAL,
     SUM(h.VALOR_REAL)               AS VALOR_REAL,
-    CASE WHEN SUM(h.VALOR_REAL) IS NULL OR SUM(h.VALOR_REAL)=0 THEN NULL
-         ELSE SUM(NVL(h.PLAZO_REPORTO,0) * h.VALOR_REAL) / SUM(h.VALOR_REAL)
+    CASE
+      WHEN SUM(h.VALOR_REAL) IS NULL OR SUM(h.VALOR_REAL) = 0 THEN NULL
+      ELSE SUM(h.PLAZO_REPORTO * h.VALOR_REAL) / SUM(h.VALOR_REAL)
     END                             AS DURACION_DIAS,
     TRUNC(MAX(e.FECHA_VTO_EM)) - TRUNC(MAX(h.REGISTRO_CONTROL)) AS DIAS_X_V,
     MAX(TRUNC(h.REGISTRO_CONTROL)) AS FECHA_CORTE,
@@ -2610,8 +2914,11 @@ def rv_snapshot_por_producto(alias: str, f_ini: pd.Timestamp, f_fin_next: pd.Tim
 #  HISTÓRICO trimestral + duración
 # =========================
 @st.cache_data(ttl=3600, show_spinner=True)
-def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int,
+def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int, cutoff_next: pd.Timestamp,
                                       contratos_key: tuple[int, ...] | None = None):
+    if contratos_key is not None and isinstance(contratos_key, pd.Index):
+        contratos_key = tuple(map(int, contratos_key.tolist()))
+
     filtro_contratos, extra_params = build_contrato_filter_sql(contratos_key, "c.ID_CLIENTE", "cid_hist_tri")
 
     SQL = f"""
@@ -2631,6 +2938,8 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int,
       WHERE c.ALIAS_CDM = :alias
         {filtro_contratos}
         AND h.REGISTRO_CONTROL >= TO_DATE('2020-01-01','YYYY-MM-DD')
+        AND h.REGISTRO_CONTROL <  TO_DATE(:cutoff_next,'YYYY-MM-DD')
+
       GROUP BY TRUNC(h.REGISTRO_CONTROL, 'Q'),
                CASE 
                  WHEN h.ID_PRODUCTO IN ({REPORTO_RV_CSV}) THEN 2
@@ -2653,7 +2962,11 @@ def hist_trimestral_papel_instrumento(alias: str, id_tipo_activo: int,
     FROM FILT f
     JOIN TOT  t ON t.Q = f.Q
     """
-    params = {"alias": alias, "id_act": id_tipo_activo}
+    params = {
+    "alias": alias,
+    "id_act": id_tipo_activo,
+    "cutoff_next": pd.to_datetime(cutoff_next).strftime("%Y-%m-%d")
+}
     params.update(extra_params)
     df = run_sql(SQL, params)
     if df.empty:
@@ -2741,8 +3054,8 @@ if not rv_df_raw.empty:
     rv_enriq_base["Nombre Completo"] = rv_enriq_base.get("Nombre Completo", rv_enriq_base["NOMBRE_EMISORA"].astype(str))
     rv_enriq_base["Nombre Completo"] = rv_enriq_base["Nombre Completo"].astype(str).str.split(",", n=1, expand=True)[0].str.strip()
 
-hist_deuda_papel, hist_deuda_instr = hist_trimestral_papel_instrumento(ALIAS_CDM, 1, CONTRATOS_KEY)
-hist_rv_papel,    hist_rv_instr    = hist_trimestral_papel_instrumento(ALIAS_CDM, 2, CONTRATOS_KEY)
+hist_deuda_papel, hist_deuda_instr = hist_trimestral_papel_instrumento(ALIAS_CDM, 1, F_DIA_FIN_NEXT, CONTRATOS_KEY)
+hist_rv_papel, hist_rv_instr = hist_trimestral_papel_instrumento(ALIAS_CDM, 2, F_DIA_FIN_NEXT, CONTRATOS_KEY)
 hist_dur = deuda_duracion_historico(ALIAS_CDM, INFLACION_ANUAL, F_DIA_FIN, CONTRATOS_KEY)
 
 # =========================
@@ -2870,14 +3183,24 @@ def plot_rend_producto_series(
         bp["FECHA"] = (bp["FECHA"] + pd.offsets.MonthEnd(0)).dt.normalize()
         bp = bp.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
         dfp = dfp.merge(bp, on="FECHA", how="left")
+        # ===============================
+        # FIX FINAL: no permitir meses > corte del sidebar
+        # ===============================
+        end_ref = _get_cutoff_month_end()
+
+        dfp["FECHA"] = pd.to_datetime(dfp["FECHA"], errors="coerce")
+        dfp = dfp[dfp["FECHA"] <= end_ref].copy()
 
     # columnas Oracle
     col_m = "TASA_M_ANUAL" if modo == "Anualizado" else "TASA_M_EFEC"
     dfp[col_m] = pd.to_numeric(dfp[col_m], errors="coerce")
-    dfp = dfp.dropna(subset=["FECHA", col_m]).copy()
-    # (KPIs comparativos vs benchmark removidos por requerimiento)
 
-
+    # ✅ EJE X coherente con el corte del reporte (y,m) y sin meses "fantasma"
+    end_ref = F_DIA_FIN  # cierre de mes aplicado en sidebar
+    dfp = _clip_monthly_df(dfp, end_ref, date_col="FECHA")
+    spine = _month_end_spine(end_ref, n=12)
+    dfp = _reindex_to_month_spine(dfp, spine, date_col="FECHA")
+   
     # Figura mensual
     fig_m = go.Figure()
     y_port = dfp[col_m] * 100.0
@@ -2885,8 +3208,8 @@ def plot_rend_producto_series(
     fig_m.add_trace(go.Bar(
         x=dfp["FECHA"],
         y=y_port,
-        name="Portafolio",
-        text=[f"{v:.1f}%" for v in y_port],
+        name="Rendimientos",
+        text=[f"{v:.1f}%" if pd.notna(v) else "" for v in y_port],
         hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
     ))
 
@@ -2924,8 +3247,6 @@ def plot_rend_producto_series(
     )
     footer_bm_prod = bench_ficha_to_markdown(rows_bm_prod, title="Benchmark (composición)")
     render_print_block(" ", fig_m, print_mode=print_mode, break_after=True, footer_md=footer_bm_prod)
-
-
 
     # -------- Acumulado (por año, 5y) --------
     tmp = build_yearly_accum_series(df_hist_prod_5y, modo, y, m, n_years=5, producto=producto)
@@ -2973,12 +3294,9 @@ def plot_rend_producto_series(
             y_bench.append(float(v) * 100.0 if pd.notna(v) else np.nan)
 
         if any(pd.notna(y_bench)):
-            # intenta traer nombre
-            bench_name2 = "Benchmark"  # leyenda corta; detalles en ficha
+            bench_name2 = "Benchmark"
             if "BENCH_LABEL" in bp.columns and bp["BENCH_LABEL"].notna().any():
                 bench_name2 = str(bp["BENCH_LABEL"].dropna().iloc[-1])
-            # Leyenda corta; detalles en ficha
-            bench_name2 = "Benchmark"
 
             fig_a.add_trace(go.Bar(
                 x=x_years,
@@ -3129,7 +3447,7 @@ def render_resumen():
                     x=["Portafolio"],
                     y=[pct],
                     name=lab,
-                    text=[f"{pct:.2f}%"],
+                    text=[f"{pct:.1f}%"],
                     hovertemplate="%{x}<br>" + lab + ": %{y:.2f}%<extra></extra>",
                 ))
 
@@ -3209,7 +3527,20 @@ def render_resumen():
         bp = bp.dropna(subset=["FECHA"])
         bp["FECHA"] = bp["FECHA"].dt.to_period("M").dt.to_timestamp("M")
         bp = bp.sort_values("FECHA").drop_duplicates(subset=["FECHA"], keep="last")
-        dfh = dfh.merge(bp[["FECHA", "BENCH_M", "BENCH_YTD"]], on="FECHA", how="left")
+        # trae BENCH_LABEL para que la leyenda muestre el nombre real
+        cols_bp = ["FECHA", "BENCH_M", "BENCH_YTD"]
+        if "BENCH_LABEL" in bp.columns:
+            cols_bp.append("BENCH_LABEL")
+
+        dfh = dfh.merge(bp[cols_bp], on="FECHA", how="left")
+        # ===============================
+        # FIX FINAL: no permitir meses > corte del sidebar
+        # ===============================
+        end_ref = _get_cutoff_month_end()
+
+        dfh["FECHA"] = pd.to_datetime(dfh["FECHA"], errors="coerce")
+        dfh = dfh[dfh["FECHA"] <= end_ref].copy()
+
 
     # columnas Oracle
     if modo == "Anualizado":
@@ -3225,33 +3556,41 @@ def render_resumen():
     # =========================
     d = _month_end_from_anio_mes(dfh, "ANIO", "MES", "FECHA")
     d[col_m] = pd.to_numeric(d[col_m], errors="coerce")
-    d = d.dropna(subset=["FECHA", col_m]).sort_values("FECHA").copy()
 
+    # ✅ EJE X coherente con el corte del reporte (y,m) y sin meses "fantasma"
+    end_ref = F_DIA_FIN  # cierre de mes aplicado en sidebar
+    d = _clip_monthly_df(d, end_ref, date_col="FECHA")
+    spine = _month_end_spine(end_ref, n=12)
+    d = _reindex_to_month_spine(d, spine, date_col="FECHA")
+    d = d.sort_values("FECHA").copy()
     fig_m = go.Figure()
 
-    y_port = (d[col_m] * 100.0)
+    # --- Serie portafolio (mensual) en % ---
+    y_port = pd.to_numeric(d[col_m], errors="coerce") * 100.0
+
     fig_m.add_trace(go.Bar(
+        name="Rendimiento",
         x=d["FECHA"],
         y=y_port,
-        name="Portafolio",
-        text=[f"{v:.1f}%" for v in y_port] if print_mode else None,  # ✅ sin decimales en impresión
-        hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
+        text=[f"{v:.1f}%" if pd.notna(v) else "" for v in y_port],
+        textposition="outside"
     ))
 
     if "BENCH_M" in d.columns:
-        bm = pd.to_numeric(d["BENCH_M"], errors="coerce")
-        if bm.notna().any():
-            bench_name = "Benchmark"
-            if "BENCH_LABEL" in d.columns and d["BENCH_LABEL"].notna().any():
-                bench_name = str(d["BENCH_LABEL"].dropna().iloc[-1])
+        y_bench = pd.to_numeric(d["BENCH_M"], errors="coerce") * 100.0
 
-            fig_m.add_trace(go.Bar(
-                x=d["FECHA"],
-                y=(bm * 100.0),
-                name=bench_name,  # ✅ nombre real
-            cliponaxis=False,
-            hovertemplate="%{x|%b-%Y}<br>%{y:.1f}%<extra></extra>",
-            ))
+        bench_name = "Benchmark"
+        if "BENCH_LABEL" in d.columns and d["BENCH_LABEL"].notna().any():
+            bench_name = str(d["BENCH_LABEL"].dropna().iloc[-1])
+
+        fig_m.add_trace(go.Bar(
+            name=bench_name,
+            x=d["FECHA"],
+            y=y_bench,
+            text=[f"{v:.1f}%" if pd.notna(v) else "" for v in y_bench],
+            textposition="outside"
+        ))
+
     fig_m.update_yaxes(title="Rendimiento (%)", ticksuffix="%", showgrid=True)
 
     _style_time_xaxis(fig_m, n_points=len(d), print_mode=print_mode)
@@ -3270,6 +3609,32 @@ def render_resumen():
     # Acumulado por año (últimos 5 años)
     # =========================
     x_years, y_years = build_yearly_accum_series(df_hist_rend_5y, modo, y, m, n_years=5)
+        # Benchmark anual (si hay bench_pack)
+    x_b, y_b = [], []
+    bench_name_y = "Benchmark"
+    if bench_pack is not None and not bench_pack.empty:
+        x_b, y_b = build_yearly_accum_series_from_bench_pack(bench_pack, y_ref=y, m_ref=m, n_years=5)
+        if "BENCH_LABEL" in bench_pack.columns and bench_pack["BENCH_LABEL"].notna().any():
+            bench_name_y = str(bench_pack["BENCH_LABEL"].dropna().iloc[-1])
+
+    # Gráfica anual vs benchmark
+    if x_years:
+        fig_y = go.Figure()
+        fig_y.add_trace(go.Bar(name="Acumulado Anual", x=x_years, y=y_years))
+
+        # Solo agrega bench si alinea y tiene datos
+        if x_b and (x_b == x_years):
+            fig_y.add_trace(go.Bar(name=bench_name_y, x=x_b, y=y_b))
+
+        fig_y.update_layout(
+            barmode="group",
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+        )
+        fig_y.update_yaxes(title="Rendimiento (%)", ticksuffix="%", showgrid=True)
+
+        _style_fig_for_mode(fig_y, print_mode=print_mode)
+        render_print_block(" ", fig_y, print_mode=print_mode, break_after=True)
 
 def render_allocation_general():
     st.subheader("Portafolio")
@@ -3343,7 +3708,7 @@ def render_allocation_detalle():
 
 def render_allocation_historico():
     st.subheader("Comportamiento de activos y estrategias")
-    aa_activo, aa_producto = aa_hist_ultimo_5_anios(ALIAS_CDM, CONTRATOS_KEY)
+    aa_activo, aa_producto = aa_hist_ultimo_5_anios(ALIAS_CDM, F_DIA_FIN_NEXT, CONTRATOS_KEY)
     c1, c2 = st.columns((1,1))
     with c1:
         if aa_activo.empty:
@@ -3439,24 +3804,56 @@ def render_deuda_riesgo(df_final):
 
     if hist_dur is not None and not hist_dur.empty:
         hd = hist_dur.copy()
-        text_vals = [f"{v:.0f}" for v in hd["DURACION_DIAS"]]
+        # ✅ Normaliza MES a cierre de mes y amarra el eje al corte (y,m)
+        hd["MES"] = pd.to_datetime(hd["MES"], errors="coerce")
+        hd = hd.dropna(subset=["MES"]).copy()
+        hd["MES"] = (hd["MES"] + pd.offsets.MonthEnd(0)).dt.normalize()
+
+        end_ref = F_DIA_FIN
+        spine = _month_end_spine(end_ref, n=12)
+        end_ref_n = (pd.to_datetime(end_ref) + pd.offsets.MonthEnd(0)).normalize()
+        hd = hd[hd["MES"] <= end_ref_n].copy()
+        hd = hd.sort_values("MES").drop_duplicates(subset=["MES"], keep="last")
+        hd = hd.set_index("MES").reindex(spine).reset_index().rename(columns={"index": "MES"})
+
+        text_vals = [f"{v:.0f}" if pd.notna(v) else "" for v in hd["DURACION_DIAS"]]
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=hd["MES"], y=hd["DURACION_DIAS"],
+            x=hd["MES"],
+            y=hd["DURACION_DIAS"],
             mode="lines+markers+text",
             name="Duración (días)",
             text=text_vals,
+            textposition="top center",
+            cliponaxis=False,
+            line=dict(width=2),
+            marker=dict(size=8),
             hovertemplate="%{x|%Y-%m}: %{y:.0f} días<extra></extra>"
         ))
+
         fig.update_layout(
             title="Duración - últimos 12 meses",
             yaxis=dict(title="Días"),
-            xaxis=dict(title="Mes", tickangle=TICKANGLE),
+            xaxis=dict(title="Mes"),
             legend=LEGEND_RIGHT,
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=10, r=220, t=42, b=6), height=BARH_H
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=10, r=220, t=60, b=6),
+            height=BARH_H
         )
-        fig = add_datapoints_to_fig(fig, decimals=1)
+
+        # ✅ FIX: eje X mensual sin meses fantasma (usa tu helper)
+        _style_time_xaxis(fig, n_points=len(hd), print_mode=print_mode)
+
+        # ✅ headroom arriba para que no corte texto (en días)
+        try:
+            ymax = pd.to_numeric(hd["DURACION_DIAS"], errors="coerce").max()
+            if pd.notna(ymax):
+                fig.update_yaxes(range=[0, float(ymax) * 1.10])
+        except Exception:
+            pass
+
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     else:
         st.caption("No hay histórico de duración disponible.")
@@ -3752,6 +4149,21 @@ def render_rv_evolucion():
     rv_ind = rv_m[rv_m["industry"].isin(ind_rank)].copy()
     piv_ind = rv_ind.pivot_table(index="MES", columns="industry", values="PctPort", aggfunc="sum").fillna(0)
     piv_ind = piv_ind[piv_ind.mean(axis=0).sort_values(ascending=False).index]
+    end_ref = F_DIA_FIN
+    spine = _month_end_spine(end_ref, n=12)
+
+    piv_sec.index = pd.to_datetime(piv_sec.index, errors="coerce")
+    piv_ind.index = pd.to_datetime(piv_ind.index, errors="coerce")
+    piv_sec = piv_sec.dropna(axis=0, how="any")
+    piv_ind = piv_ind.dropna(axis=0, how="any")
+
+    piv_sec.index = (piv_sec.index + pd.offsets.MonthEnd(0)).normalize()
+    piv_ind.index = (piv_ind.index + pd.offsets.MonthEnd(0)).normalize()
+
+    end_ref_n = (pd.to_datetime(end_ref) + pd.offsets.MonthEnd(0)).normalize()
+    piv_sec = piv_sec[piv_sec.index <= end_ref_n].reindex(spine).fillna(0)
+    piv_ind = piv_ind[piv_ind.index <= end_ref_n].reindex(spine).fillna(0)
+
     fig_sec = go.Figure()
     for col in piv_sec.columns:
         fig_sec.add_trace(go.Scatter(
