@@ -792,6 +792,173 @@ def render_oficinas(b: pd.DataFrame) -> None:
         key="dl_oficinas",
     )
 
+# ── TAB 4: Gráficas ───────────────────────────────────────────────────────────
+def render_graficas(b: pd.DataFrame) -> None:
+    if b.empty:
+        st.info("Sin datos con los filtros actuales.")
+        return
+
+    C_BLUE  = "#1E3A5F"
+    C_AMBER = "#D97706"
+    C_GREEN = "#16A34A"
+    C_RED   = "#DC2626"
+    C_LIGHT = "#93C5FD"
+    FONT    = dict(family="Inter, system-ui, sans-serif", size=12)
+    LAYOUT  = dict(plot_bgcolor="white", paper_bgcolor="white", font=FONT,
+                   showlegend=False, margin=dict(t=10, b=10, l=10, r=10))
+
+    # ── 1. Embudo de captación ─────────────────────────────────────────────
+    st.markdown("#### Embudo de captación generacional")
+    total_ben   = len(b)
+    con_curp    = int((~b["CURP_VACIO"]).sum())
+    no_clientes = int((~b["CURP_VACIO"] & ~b["ES_CLIENTE"]).sum())
+    contactable = int((~b["CURP_VACIO"] & ~b["ES_CLIENTE"] & b["CONTACTABLE"]).sum())
+
+    fig_funnel = go.Figure(go.Funnel(
+        y=["Total beneficiarios", "Con CURP registrado", "No son clientes", "Contactables"],
+        x=[total_ben, con_curp, no_clientes, contactable],
+        textposition="inside",
+        textinfo="value+percent initial",
+        marker=dict(color=[C_BLUE, "#64748B", C_AMBER, C_GREEN]),
+        connector=dict(line=dict(color="#E2E8F0", width=1)),
+    ))
+    fig_funnel.update_layout(height=300, **LAYOUT)
+    st.plotly_chart(fig_funnel, use_container_width=True)
+
+    st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+    # ── 2. Coverage por oficina  +  Valor en riesgo por generación ────────
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Coverage por oficina")
+        agg_of = (
+            b.groupby("OFICINA", as_index=False)
+             .agg(BEN=("NOMBRE_BENEFICIARIO", "count"), CLI=("ES_CLIENTE", "sum"))
+             .assign(COV=lambda d: d["CLI"] / d["BEN"].replace(0, np.nan))
+             .sort_values("COV")
+        )
+        colors_of = [C_GREEN if v >= 0.75 else C_AMBER if v >= 0.40 else C_RED
+                     for v in agg_of["COV"].fillna(0)]
+        fig_of = go.Figure(go.Bar(
+            x=agg_of["COV"], y=agg_of["OFICINA"],
+            orientation="h",
+            marker_color=colors_of,
+            text=agg_of["COV"].map("{:.1%}".format),
+            textposition="outside",
+        ))
+        fig_of.update_layout(
+            xaxis=dict(tickformat=".0%", range=[0, 1.15], gridcolor="#F1F5F9"),
+            yaxis=dict(tickfont=dict(size=11)),
+            height=max(280, len(agg_of) * 36 + 60),
+            margin=dict(t=10, b=10, l=10, r=60),
+            **{k: v for k, v in LAYOUT.items() if k != "margin"},
+        )
+        st.plotly_chart(fig_of, use_container_width=True)
+
+    with col2:
+        st.markdown("#### Valor en riesgo por generación del titular")
+        bins   = [0, 35, 50, 65, 80, 200]
+        labels = ["< 35", "35–49", "50–64", "65–79", "≥ 80 (Silent)"]
+        prosp  = b[~b["CURP_VACIO"] & ~b["ES_CLIENTE"]].copy()
+        prosp["GEN"] = pd.cut(prosp["EDAD_CLIENTE"].fillna(0),
+                              bins=bins, labels=labels, right=False)
+        agg_gen = (
+            prosp.groupby("GEN", as_index=False, observed=True)
+                 .agg(VALOR=("VALOR_CONTRATO_ACTUAL", "sum"),
+                      N=("NOMBRE_BENEFICIARIO", "count"))
+        )
+        colors_gen = [C_RED if str(l) == "≥ 80 (Silent)" else
+                      C_AMBER if str(l) == "65–79" else C_BLUE
+                      for l in agg_gen["GEN"]]
+        fig_gen = go.Figure(go.Bar(
+            x=agg_gen["GEN"].astype(str),
+            y=agg_gen["VALOR"],
+            marker_color=colors_gen,
+            text=agg_gen["VALOR"].apply(fmt_mdp),
+            textposition="outside",
+            customdata=agg_gen["N"],
+            hovertemplate="<b>%{x}</b><br>Valor: %{text}<br>Prospectos: %{customdata}<extra></extra>",
+        ))
+        fig_gen.update_layout(
+            yaxis=dict(tickformat="$,.0f", gridcolor="#F1F5F9"),
+            height=max(280, len(agg_gen) * 36 + 60),
+            **LAYOUT,
+        )
+        st.plotly_chart(fig_gen, use_container_width=True)
+
+    # ── 3. Parentesco  +  Contactabilidad ─────────────────────────────────
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.markdown("#### Parentesco — prospectos no captados")
+        par = (
+            b[~b["ES_CLIENTE"]]
+            .groupby("PARENTESCO", as_index=False)
+            .agg(N=("NOMBRE_BENEFICIARIO", "count"))
+            .sort_values("N", ascending=False)
+            .head(8)
+        )
+        fig_par = go.Figure(go.Pie(
+            labels=par["PARENTESCO"],
+            values=par["N"],
+            hole=0.45,
+            textinfo="label+percent",
+            textposition="outside",
+            marker=dict(colors=["#1E3A5F","#2563EB","#3B82F6","#60A5FA",
+                                 "#93C5FD","#BFDBFE","#DBEAFE","#EFF6FF"]),
+        ))
+        fig_par.update_layout(height=320, **LAYOUT)
+        st.plotly_chart(fig_par, use_container_width=True)
+
+    with col4:
+        st.markdown("#### Contactabilidad — prospectos identificados")
+        pc = b[~b["CURP_VACIO"] & ~b["ES_CLIENTE"]]
+        cont_labels = ["Tel. y correo", "Solo teléfono", "Solo correo", "Sin contacto"]
+        cont_vals = [
+            int((pc["TIENE_TELEFONO"] & pc["TIENE_CORREO"]).sum()),
+            int((pc["TIENE_TELEFONO"] & ~pc["TIENE_CORREO"]).sum()),
+            int((~pc["TIENE_TELEFONO"] & pc["TIENE_CORREO"]).sum()),
+            int((~pc["CONTACTABLE"]).sum()),
+        ]
+        fig_cont = go.Figure(go.Pie(
+            labels=cont_labels, values=cont_vals,
+            hole=0.45,
+            marker=dict(colors=[C_GREEN, C_BLUE, C_LIGHT, C_RED]),
+            textinfo="label+percent",
+            textposition="outside",
+        ))
+        fig_cont.update_layout(height=320, **LAYOUT)
+        st.plotly_chart(fig_cont, use_container_width=True)
+
+    # ── 4. Top promotores por valor asignado a prospectos ─────────────────
+    st.markdown("#### Top promotores — valor asignado a prospectos no captados")
+    top_prom = (
+        b[~b["CURP_VACIO"] & ~b["ES_CLIENTE"]]
+        .groupby("PROMOTOR", as_index=False)
+        .agg(VALOR=("VALOR_ASIGNADO", "sum"), N=("NOMBRE_BENEFICIARIO", "count"))
+        .sort_values("VALOR", ascending=True)
+        .tail(15)
+    )
+    fig_prom = go.Figure(go.Bar(
+        x=top_prom["VALOR"], y=top_prom["PROMOTOR"],
+        orientation="h",
+        marker_color=C_BLUE,
+        text=top_prom["VALOR"].apply(fmt_mdp),
+        textposition="outside",
+        customdata=top_prom["N"],
+        hovertemplate="<b>%{y}</b><br>Valor asignado: %{text}<br>Prospectos: %{customdata}<extra></extra>",
+    ))
+    fig_prom.update_layout(
+        xaxis=dict(tickformat="$,.0f", gridcolor="#F1F5F9"),
+        yaxis=dict(tickfont=dict(size=11)),
+        height=max(300, len(top_prom) * 36 + 60),
+        margin=dict(t=10, b=10, l=10, r=80),
+        **{k: v for k, v in LAYOUT.items() if k != "margin"},
+    )
+    st.plotly_chart(fig_prom, use_container_width=True)
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style="border-bottom:2px solid #E2E8F0;padding-bottom:14px;margin-bottom:20px">
@@ -820,10 +987,11 @@ benef_f = sidebar_filters(benef_df)
 
 active_tab = st.session_state.pop("active_tab", 0)
 
-tabs = st.tabs(["Radar", "Detalle Cliente", "Oficinas"])
+tabs = st.tabs(["Radar", "Gráficas", "Detalle Cliente", "Oficinas"])
 with tabs[0]: render_radar(benef_f)
-with tabs[1]: render_detail(benef_f)
-with tabs[2]: render_oficinas(benef_f)
+with tabs[1]: render_graficas(benef_f)
+with tabs[2]: render_detail(benef_f)
+with tabs[3]: render_oficinas(benef_f)
 
 if active_tab > 0:
     st.markdown(
